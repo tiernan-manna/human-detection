@@ -1,0 +1,8 @@
+ultralytics>=8.3.0
+supervision>=0.25.0
+opencv-python>=4.10.0
+numpy>=1.26.0,<2.3.0
+huggingface-hub>=0.27.0
+sahi>=0.11.0
+Pillow>=10.0.0
+pytest>=8.3.0

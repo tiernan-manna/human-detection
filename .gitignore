@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Model weights (downloaded on first run, too large for git)
+models/
+*.pt
+*.onnx
+
+# Inference outputs
+outputs/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
