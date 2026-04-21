@@ -19,6 +19,7 @@ models/
 
 # Inference outputs
 outputs/
+sample_images/
 
 # OS / IDE
 .DS_Store
