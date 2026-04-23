@@ -52,6 +52,30 @@ def _filter_min_box_size(
     return detections[mask]
 
 
+def _filter_aspect_ratio(
+    detections: sv.Detections,
+    ratio_min: float,
+    ratio_max: float,
+) -> sv.Detections:
+    """Drop detections whose width/height ratio is outside [min, max].
+
+    A person viewed from above sits comfortably within ~0.5–2.0 ratio.
+    Extreme horizontals (power lines, fences, garden hoses) and extreme
+    verticals (lamp-posts, pipes) almost always fall outside 0.25–4.0,
+    so this is a cheap false-positive cull that virtually never rejects
+    real people. `ratio_min <= 0 or ratio_max <= 0` disables the filter.
+    """
+    if len(detections) == 0 or ratio_min <= 0 or ratio_max <= 0:
+        return detections
+    widths = detections.xyxy[:, 2] - detections.xyxy[:, 0]
+    heights = detections.xyxy[:, 3] - detections.xyxy[:, 1]
+    # Guard against degenerate zero-height boxes the model occasionally emits.
+    safe_heights = np.where(heights > 0, heights, 1e-6)
+    ratios = widths / safe_heights
+    mask = (ratios >= ratio_min) & (ratios <= ratio_max)
+    return detections[mask]
+
+
 def _pick_device(override: str | None) -> str:
     if override:
         return override
@@ -116,11 +140,33 @@ class WaldoDetector:
             dtype=bool,
         )
         detections = detections[mask]
-        return _filter_min_box_size(detections, frame, self._config.min_box_fraction)
+        detections = _filter_min_box_size(
+            detections, frame, self._config.min_box_fraction
+        )
+        return _filter_aspect_ratio(
+            detections,
+            self._config.aspect_ratio_min,
+            self._config.aspect_ratio_max,
+        )
 
     @property
     def class_names(self) -> dict[int, str]:
         return dict(self._class_names)
+
+    def warmup(self, rounds: int = 3) -> None:
+        """Run dummy inferences so the first real frame doesn't pay the
+        one-time model-load + JIT cost (on MPS that's ~30 s). Safe to call
+        from a background thread at startup."""
+        self._load()
+        assert self._model is not None
+        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        for _ in range(max(1, rounds)):
+            self._model.predict(
+                source=dummy,
+                conf=self._config.confidence_threshold,
+                device=self._device,
+                verbose=False,
+            )
 
 
 class SahiDetector:
@@ -202,4 +248,11 @@ class SahiDetector:
 
         # Suppress duplicate boxes produced at tile boundaries.
         detections = detections.with_nms(threshold=self._nms_threshold)
-        return _filter_min_box_size(detections, frame, self._config.min_box_fraction)
+        detections = _filter_min_box_size(
+            detections, frame, self._config.min_box_fraction
+        )
+        return _filter_aspect_ratio(
+            detections,
+            self._config.aspect_ratio_min,
+            self._config.aspect_ratio_max,
+        )
