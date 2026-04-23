@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Human Detection Sidecar — Demo</title>
+  <link rel="stylesheet" href="/demo/demo.css" />
+</head>
+<body>
+  <header>
+    <div class="title-row">
+      <h1>Human Detection Sidecar</h1>
+      <span id="ws-state" class="state-pill state-pending">connecting…</span>
+    </div>
+
+    <div class="stats-row">
+      <div class="stat">
+        <span class="stat-label">tiles</span>
+        <span class="stat-value" id="stat-tiles">0</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">fps in</span>
+        <span class="stat-value" id="stat-fps-in">0.0</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">fps out</span>
+        <span class="stat-value" id="stat-fps-out">0.0</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">avg ms</span>
+        <span class="stat-value" id="stat-avg-ms">0</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">p95 ms</span>
+        <span class="stat-value" id="stat-p95-ms">0</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">drops</span>
+        <span class="stat-value" id="stat-drops">0</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">device</span>
+        <span class="stat-value" id="stat-device">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">model</span>
+        <span class="stat-value stat-value-small" id="stat-model">—</span>
+      </div>
+    </div>
+
+    <div class="controls-row">
+      <label>
+        tiles
+        <input type="number" id="ctl-tiles" min="1" max="30" value="15" />
+      </label>
+      <label>
+        rate (Hz)
+        <input type="number" id="ctl-hz" min="0.2" max="5" step="0.1" value="1" />
+      </label>
+      <label class="checkbox">
+        <input type="checkbox" id="ctl-low-light" />
+        low-light mode
+      </label>
+      <label class="checkbox">
+        <input type="checkbox" id="ctl-labels" checked />
+        show labels
+      </label>
+      <button id="ctl-pause" type="button">pause</button>
+      <button id="ctl-reset" type="button">reset stats</button>
+    </div>
+  </header>
+
+  <main id="grid"></main>
+
+  <footer>
+    <span>
+      This demo cycles through the images in the sidecar's
+      <code>sample_images/</code> folder and runs each one through
+      <code>/detect</code> at the configured rate. Red boxes are drawn from
+      whatever the sidecar returns. No video — these are static test images.
+    </span>
+  </footer>
+
+  <script src="/demo/demo.js"></script>
+</body>
+</html>
