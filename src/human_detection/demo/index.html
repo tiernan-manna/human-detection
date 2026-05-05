@@ -14,59 +14,94 @@
     </div>
 
     <div class="stats-row">
-      <div class="stat">
+      <div class="stat" title="Number of simulated drones the demo is currently cycling through. Each tile corresponds to one uavId the sidecar sees.">
         <span class="stat-label">tiles</span>
         <span class="stat-value" id="stat-tiles">0</span>
       </div>
-      <div class="stat">
+      <div class="stat" title="Frames per second the demo is SENDING into the sidecar across all tiles (tiles × rate Hz). This is the demand.">
         <span class="stat-label">fps in</span>
         <span class="stat-value" id="stat-fps-in">0.0</span>
       </div>
-      <div class="stat">
+      <div class="stat" title="Frames per second the sidecar RETURNED results for across all tiles over the last second. The real-world throughput. (fps in − fps out) is roughly what's being dropped.">
         <span class="stat-label">fps out</span>
         <span class="stat-value" id="stat-fps-out">0.0</span>
       </div>
-      <div class="stat">
+      <div class="stat" title="Average per-frame inference time over the last ~50 completed frames. This is how long ONE YOLO forward pass takes on your device. Theoretical max throughput = 1000 / avg_ms.">
         <span class="stat-label">avg ms</span>
         <span class="stat-value" id="stat-avg-ms">0</span>
       </div>
-      <div class="stat">
+      <div class="stat" title="95th-percentile per-frame inference time — 95% of frames complete faster than this. Spikes above avg usually come from MPS JIT, thermal throttling, or a browser tab stealing CPU.">
         <span class="stat-label">p95 ms</span>
         <span class="stat-value" id="stat-p95-ms">0</span>
       </div>
-      <div class="stat">
+      <div class="stat" title="Theoretical sustained throughput on this hardware = 1000 / avg_ms. Compare against 'fps in' (demand): if demand > capacity, frames are being dropped. If it's well above 10 on the pilot PC, 10 drones × 1 Hz has comfortable headroom.">
+        <span class="stat-label">capacity fps</span>
+        <span class="stat-value" id="stat-capacity">—</span>
+      </div>
+      <div class="stat" title="Cumulative count of frames the demo sent that never came back (sidecar dropped them because inference couldn't keep up). Per sidecar policy, the OLDEST pending frame for a uavId is always dropped first so video quality is never affected.">
         <span class="stat-label">drops</span>
         <span class="stat-value" id="stat-drops">0</span>
       </div>
-      <div class="stat">
+      <div class="stat" title="Hardware backend the sidecar is running inference on. mps = Apple GPU, cuda = Nvidia GPU, cpu = fallback (much slower).">
         <span class="stat-label">device</span>
         <span class="stat-value" id="stat-device">—</span>
       </div>
-      <div class="stat">
+      <div class="stat" title="The detection model loaded by the sidecar. Larger models (yolov8l) are more accurate but slower than smaller ones (yolov8n/s/m).">
         <span class="stat-label">model</span>
         <span class="stat-value stat-value-small" id="stat-model">—</span>
       </div>
     </div>
 
     <div class="controls-row">
-      <label>
-        tiles
-        <input type="number" id="ctl-tiles" min="1" max="30" value="15" />
+      <label title="How many simulated drones to run. Each tile is an independent uavId sending its own frames. Default is 0 \u2014 the sidecar processes nothing from the demo until you raise this. Live drone footage from manna-dash is unaffected and continues to flow regardless.">
+        tiles (test mode)
+        <input type="number" id="ctl-tiles" min="0" max="30" value="0" />
       </label>
-      <label>
+      <label title="How often each tile sends a frame. Production target is 1 Hz per drone. Higher rates just stress-test the sidecar; the pilot dashboard will never send faster than 1 Hz.">
         rate (Hz)
         <input type="number" id="ctl-hz" min="0.2" max="5" step="0.1" value="1" />
       </label>
-      <label class="checkbox">
+      <label class="checkbox" title="Sets the `isLowLight` flag on outgoing frames. The sidecar uses a lower confidence threshold when this is true, mimicking the sunset→sunrise window in the real dashboard.">
         <input type="checkbox" id="ctl-low-light" />
         low-light mode
       </label>
-      <label class="checkbox">
+      <label class="checkbox" title="Toggle the 'Person 0.74' text labels on detections. The sidecar's output is unchanged; this is purely a client-side drawing choice.">
         <input type="checkbox" id="ctl-labels" checked />
         show labels
       </label>
-      <button id="ctl-pause" type="button">pause</button>
-      <button id="ctl-reset" type="button">reset stats</button>
+      <button id="ctl-pause" type="button" title="Stop sending new frames to the sidecar. Already-pending inferences still come back, but no new work is queued.">pause</button>
+      <button id="ctl-reset" type="button" title="Zero out the avg/p95/drops counters. The sidecar itself is untouched.">reset stats</button>
+      <span class="rec-group">
+        <button id="ctl-record" type="button" class="record-btn"
+                title="Start/stop archiving every frame the sidecar receives (from any client, including manna-dash). Recorded sessions land under `recordings/` and can be replayed with scripts/replay_recording.py.">● record</button>
+        <span id="rec-state" class="rec-state"
+              title="Current recording state. While active, shows frame count and any drops caused by a slow disk.">idle</span>
+      </span>
+    </div>
+    <div id="live-preview" class="rec-preview"
+         title="Latest frame received per uavId on /detect, regardless of recording state. Updates every 2 s. Use this to confirm a connected client (eg manna-dash, the SITL replay script) is actually sending frames.">
+      <div class="rec-preview-header">
+        <strong>Live monitor</strong>
+        <span class="rec-preview-hint">
+          Latest frame per drone arriving on <code>/detect</code>. Updates every 2&nbsp;s.
+          Use the per-tile <strong>rec</strong> toggle to choose which drones get
+          captured — applies before and during a recording.
+        </span>
+        <button id="ctl-live-clear" type="button" class="record-btn" style="margin-left:auto;background:#374151"
+                title="Drop the cached live frames. Useful when a stream went silent and you want the panel to repopulate from scratch.">clear</button>
+      </div>
+      <div id="live-preview-grid" class="rec-preview-grid"></div>
+    </div>
+
+    <div id="rec-preview" class="rec-preview" hidden
+         title="Thumbnail of the latest captured frame per drone — lets you visually confirm the right content is being archived.">
+      <div class="rec-preview-header">
+        <strong>Recording preview</strong>
+        <span class="rec-preview-hint">
+          Latest captured frame per drone. Updates every 2&nbsp;s.
+        </span>
+      </div>
+      <div id="rec-preview-grid" class="rec-preview-grid"></div>
     </div>
   </header>
 
@@ -78,6 +113,12 @@
       <code>sample_images/</code> folder and runs each one through
       <code>/detect</code> at the configured rate. Red boxes are drawn from
       whatever the sidecar returns. No video — these are static test images.
+      <br />
+      <strong>Note:</strong> this page is a <em>client</em> of the sidecar,
+      not its own detector. Opening it in multiple tabs (or running it
+      alongside manna-dash) sends that many times more frames to the
+      <em>same</em> sidecar process, so throughput numbers degrade because
+      demand stacks, not because anything is duplicated.
     </span>
   </footer>
 

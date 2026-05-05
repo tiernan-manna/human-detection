@@ -186,6 +186,8 @@ main#grid {
   position: relative;
   width: 100%;
   background: #000;
+  /* aspect-ratio is set per-tile from the image's natural dimensions in JS.
+     Fallback 4/3 keeps the layout reasonable before the image loads. */
   aspect-ratio: 4 / 3;
   overflow: hidden;
 }
@@ -262,4 +264,167 @@ footer code {
   padding: 1px 5px;
   border-radius: 3px;
   font-size: 11px;
+}
+
+/* --- Record button ------------------------------------------------------ */
+.rec-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.record-btn {
+  background: var(--bg);
+  color: var(--err);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.record-btn:hover {
+  border-color: var(--err);
+}
+
+.record-btn.recording {
+  background: var(--err);
+  color: var(--text);
+  border-color: var(--err);
+  animation: rec-pulse 1.4s infinite;
+}
+
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+.rec-state {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.rec-state.active {
+  color: var(--err);
+}
+
+/* --- Recording preview strip ------------------------------------------- */
+.rec-preview {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--err);
+  border-radius: 6px;
+}
+
+.rec-preview-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 8px;
+  color: var(--err);
+}
+
+.rec-preview-hint {
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: normal;
+}
+
+.rec-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 8px;
+}
+
+.rec-preview-tile {
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.rec-preview-tile img {
+  width: 100%;
+  height: auto;
+  display: block;
+  /* object-fit on an auto-height img is a no-op; aspect-ratio comes
+     from the natural image dimensions. */
+}
+
+.rec-preview-tile .rec-preview-meta {
+  padding: 4px 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rec-preview-tile .rec-preview-uav {
+  color: var(--text);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rec-preview-empty {
+  grid-column: 1 / -1;
+  color: var(--text-dim);
+  font-style: italic;
+  padding: 16px;
+  text-align: center;
+}
+
+/* --- Live monitor: per-uav recording toggle ---------------------------- */
+.rec-preview-tile {
+  position: relative;
+}
+
+.live-rec-toggle {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 10px;
+  background: rgba(13, 17, 23, 0.7);
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  border: 1px solid rgba(255, 59, 59, 0.55);
+  user-select: none;
+  backdrop-filter: blur(2px);
+}
+
+.live-rec-toggle input {
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--err);
+}
+
+.rec-preview-tile.excluded {
+  opacity: 0.55;
+}
+
+.rec-preview-tile.excluded .live-rec-toggle {
+  border-color: var(--border);
+  color: var(--text-dim);
+}
+
+.rec-preview-tile.excluded img {
+  filter: grayscale(0.85);
 }

@@ -134,6 +134,13 @@ class Config:
     # for the detection to pass the motion gate.
     hover_motion_box_fraction: float = 0.02
 
+    # --- Recording / archiving ---------------------------------------------
+    # Directory where /record/* endpoints write recorded sessions. Relative
+    # paths resolve against the sidecar CWD (usually the repo root via
+    # start_sidecar.sh). Contains JPEG frames + telemetry JSONL — do NOT
+    # commit; the .gitignore already excludes it.
+    recordings_dir: str = "recordings"
+
     @classmethod
     def from_env(cls) -> "Config":
         return cls(
@@ -203,6 +210,7 @@ class Config:
             hover_motion_box_fraction=float(
                 os.getenv("HUMAN_DETECTION_HOVER_MOTION_FRAC", "0.02")
             ),
+            recordings_dir=os.getenv("HUMAN_DETECTION_RECORDINGS_DIR", "recordings"),
         )
 
 

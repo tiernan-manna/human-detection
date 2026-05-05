@@ -21,6 +21,10 @@ models/
 outputs/
 sample_images/
 
+# Recorded flight sessions (JPEGs + telemetry).
+# Can contain PII from real delivery footage — never commit.
+recordings/
+
 # OS / IDE
 .DS_Store
 .idea/

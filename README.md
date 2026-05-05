@@ -442,6 +442,76 @@ Notes:
   means a freshly-started sidecar will show 0 det on all tiles for the
   first ~30 s; after that boxes appear live.
 
+## Recording & replay
+
+The sidecar can archive a live flight — JPEG frames, headers, telemetry,
+the lot — so you can re-run the detector against known data after
+changing thresholds or model weights. Recording is controlled over HTTP
+(not the WS) so it can be driven from `curl`, the `/demo` page (there's
+a red **● record** button in the toolbar), or a future manna-dash UI.
+
+Start / stop:
+
+```bash
+curl -XPOST localhost:8765/record/start \
+     -H 'content-type: application/json' \
+     -d '{"sessionName":"sim-run-1","note":"hover gate regression"}'
+
+curl -XPOST localhost:8765/record/stop
+```
+
+Status / listing / delete:
+
+```bash
+curl localhost:8765/record/status
+curl localhost:8765/recordings
+curl -XDELETE localhost:8765/recordings/2026-04-17T14-23-05Z_sim-run-1
+```
+
+Each session is a directory under `recordings/` (configurable via
+`HUMAN_DETECTION_RECORDINGS_DIR`). Layout:
+
+```
+recordings/
+  2026-04-17T14-23-05Z_sim-run-1/
+    manifest.json      # session metadata + full config snapshot
+    frames.jsonl       # one line per captured frame
+    frames/
+      000001.jpg       # raw JPEG as received from the client
+      000002.jpg
+```
+
+`frames.jsonl` is one JSON object per line with `seq`, `received_at`
+(server wall-clock), `client_ts` (from the WS header), `uav_id`,
+`is_low_light`, `img_w`, `img_h`, `jpeg` (relative path), and
+optionally the full `telemetry` the client attached.
+
+Recording is **off the hot path**: `capture()` enqueues a reference onto
+a bounded queue; a background task does the disk IO. If the queue fills
+up (slow disk) the recorder drops frames and logs — it never back-
+pressures the live detector. Drops are counted in `/record/status`.
+
+Replay a session back into the sidecar:
+
+```bash
+# Live-paced (reproduces original inter-frame gaps):
+python scripts/replay_recording.py recordings/<session>
+
+# Fixed rate, filter to one drone, custom sidecar URL:
+python scripts/replay_recording.py recordings/<session> \
+    --fps 2 --uav UAV-7 --sidecar ws://127.0.0.1:8765/detect
+
+# Benchmark: fire frames as fast as the sidecar will take them
+python scripts/replay_recording.py recordings/<session> --as-fast-as-possible
+```
+
+The replayer sends the **captured** `ts` (not wall-clock now), so log
+lines line up one-to-one between the original and the replay — makes
+detector diffs trivial to read.
+
+Recordings can contain PII from real delivery footage. `recordings/` is
+gitignored; do not commit a session.
+
 ## Manual QA runbook
 
 The integration has four correctness properties the pilot depends on. Each
@@ -571,6 +641,21 @@ many of those carry a ByteTrack-managed `trackId`. With the default
    before the first real client connects.
 2. The first real frame's `ms` in the log should match subsequent
    frames (~80-150 ms on M3, not the ~30000 ms cold start).
+
+### 11. Recording round-trip
+
+1. Start the sidecar and the /demo page (or a live manna-dash flight).
+2. Click the red **● record** button (or `POST /record/start`). Confirm
+   `/record/status` returns `"active": true`.
+3. Let a handful of frames flow through. The button label should update
+   to show a live frame count.
+4. Stop the recording. A new dir exists under `recordings/` with a
+   `manifest.json`, `frames.jsonl`, and one JPEG per frame. The
+   `frames_captured` counter in the manifest matches the number of
+   JSONL lines and the number of JPEGs on disk.
+5. Replay the session: `python scripts/replay_recording.py recordings/<dir>`
+   and confirm the sidecar log shows one `uav=... dets=...` line per
+   replayed frame, with `ts` values matching the captured `client_ts`.
 
 ## Roadmap
 

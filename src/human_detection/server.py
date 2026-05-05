@@ -44,6 +44,18 @@ Server -> client (text WS message, one per processed frame):
     `trackId` is included when the detection has been associated with a
     persistent track. It is stable across frames for the same uavId; clients
     can use it to draw flicker-free boxes and to count unique people.
+
+Recording
+---------
+The sidecar can archive the *client-sent* stream (header + telemetry +
+JPEG) to disk so a session can be replayed offline via
+`scripts/replay_recording.py`. Control it over HTTP:
+
+    POST /record/start    {"sessionName"?: str, "note"?: str}  -> status
+    POST /record/stop                                          -> status
+    GET  /record/status                                        -> status
+    GET  /recordings                                           -> [manifests]
+    DELETE /recordings/{name}                                  -> {deleted}
 """
 
 from __future__ import annotations
@@ -58,13 +70,15 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from human_detection.config import Config
 from human_detection.detector import _pick_device
 from human_detection.inference_worker import FrameJob, InferenceWorker, parse_telemetry
+from human_detection.live_monitor import LiveFrameStore
+from human_detection.recorder import Recorder, _is_safe_leaf
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +93,7 @@ _DEMO_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 def create_app(
     config: Config | None = None,
     worker: InferenceWorker | None = None,
+    recorder: Recorder | None = None,
 ) -> FastAPI:
     """Build the FastAPI app. Kept as a factory so tests can inject a config
     and/or a pre-built worker (typically one with a stub detector)."""
@@ -87,12 +102,29 @@ def create_app(
     if worker is None:
         worker = InferenceWorker(effective_config)
 
+    # Resolve recordings dir relative to CWD so the default `recordings/`
+    # always lands next to the sidecar the user actually started.
+    if recorder is None:
+        recordings_root = Path(effective_config.recordings_dir)
+        if not recordings_root.is_absolute():
+            recordings_root = Path.cwd() / recordings_root
+        recorder = Recorder(effective_config, base_dir=recordings_root)
+
+    live_frames = LiveFrameStore()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await worker.start()
         try:
             yield
         finally:
+            # Flush any in-flight recording before stopping the worker so
+            # we don't lose the tail of a session on Ctrl-C.
+            if recorder.active:
+                try:
+                    await recorder.stop_session()
+                except Exception:
+                    log.exception("failed to stop recorder during shutdown")
             await worker.stop()
 
     app = FastAPI(
@@ -114,6 +146,8 @@ def create_app(
 
     app.state.config = effective_config
     app.state.worker = worker
+    app.state.recorder = recorder
+    app.state.live_frames = live_frames
 
     @app.get("/health")
     async def health() -> dict:
@@ -155,13 +189,45 @@ def create_app(
             while True:
                 raw = await ws.receive_bytes()
                 try:
-                    job = _decode_frame(raw, reply)
+                    job, is_demo = _decode_frame(raw, reply)
                 except ValueError as e:
                     log.warning("rejecting malformed frame: %s", e)
                     continue
+                # `isDemo` is set by the bundled /demo page on its synthetic
+                # sample-image streams. Those frames still go through
+                # detection (otherwise the demo wouldn't be a useful
+                # showcase) but they are deliberately kept *out* of the
+                # live monitor and the recorder, both of which exist to
+                # capture real drone footage. Real clients (manna-dash)
+                # never set the flag.
+                if not is_demo:
+                    live_frames.set(
+                        uav_id=job.uav_id,
+                        client_ts_ms=job.ts_ms,
+                        img_w=job.img_w,
+                        img_h=job.img_h,
+                        is_low_light=job.is_low_light,
+                        jpeg=job.jpeg_bytes,
+                        telemetry=job.telemetry,
+                    )
+                    # Record before submitting so a crash inside the worker
+                    # doesn't cost us the frame in the archive.
+                    if recorder.active:
+                        recorder.capture(
+                            uav_id=job.uav_id,
+                            client_ts_ms=job.ts_ms,
+                            is_low_light=job.is_low_light,
+                            img_w=job.img_w,
+                            img_h=job.img_h,
+                            jpeg=job.jpeg_bytes,
+                            telemetry=job.telemetry,
+                        )
                 await worker.submit(job)
         except WebSocketDisconnect:
             log.info("client disconnected")
+
+    _register_recording_routes(app, recorder)
+    _register_live_routes(app, live_frames)
 
     # --- Demo page ---------------------------------------------------------
     # Serves a static HTML/JS page that runs N tiles against /detect so you
@@ -171,6 +237,137 @@ def create_app(
     _register_demo_routes(app, effective_config)
 
     return app
+
+
+def _register_recording_routes(app: FastAPI, recorder: Recorder) -> None:
+    """Mount /record/* and /recordings endpoints.
+
+    These are small HTTP surfaces (not WS) so you can drive them from
+    curl, the /demo page, or a future manna-dash button without bumping
+    the WS protocol version.
+    """
+
+    @app.get("/record/status")
+    async def record_status() -> dict:
+        return asdict(recorder.status())
+
+    @app.post("/record/start")
+    async def record_start(body: dict = Body(default_factory=dict)) -> dict:
+        # Accept both camelCase (browser-friendly) and snake_case (curl).
+        name = body.get("sessionName") or body.get("session_name") or body.get("name")
+        note = body.get("note")
+        if name is not None and not isinstance(name, str):
+            raise HTTPException(status_code=400, detail="sessionName must be a string")
+        if note is not None and not isinstance(note, str):
+            raise HTTPException(status_code=400, detail="note must be a string")
+        try:
+            status = await recorder.start_session(name=name, note=note)
+        except RuntimeError as e:
+            # 409 = "state conflict" — caller tried to start while we were
+            # already recording. They should stop first.
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        return asdict(status)
+
+    @app.post("/record/stop")
+    async def record_stop() -> dict:
+        status = await recorder.stop_session()
+        return asdict(status)
+
+    @app.get("/record/selection")
+    async def record_selection_get() -> dict:
+        """Per-uav opt-out state. UI uses this to render the live monitor
+        toggles in agreement with what the sidecar will actually record."""
+        return recorder.selection()
+
+    @app.post("/record/selection")
+    async def record_selection_set(body: dict = Body(default_factory=dict)) -> dict:
+        """Replace the excluded-uav set. Body shape: ``{"excluded": [str, ...]}``.
+
+        Takes effect immediately whether a session is active or not, so the
+        operator can:
+          - pre-select drones before hitting record;
+          - pause individual drones mid-session without affecting the
+            others;
+          - resume a paused drone at any time.
+        """
+        excluded = body.get("excluded", [])
+        if not isinstance(excluded, list):
+            raise HTTPException(status_code=400, detail="excluded must be a list")
+        try:
+            return recorder.set_excluded_uavs(excluded)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    @app.get("/record/preview")
+    async def record_preview_list() -> list[dict]:
+        """Per-uav preview metadata for the UI. JPEG payload is served
+        separately so polling this is cheap."""
+        return recorder.preview_list()
+
+    @app.get("/record/preview/{uav_id}")
+    async def record_preview_jpeg(uav_id: str) -> Response:
+        """Latest JPEG captured for `uav_id` during the active session.
+
+        Returns 404 until a frame for that drone has been recorded; the
+        demo page handles that gracefully (shows a placeholder).
+        """
+        jpeg = recorder.preview_jpeg(uav_id)
+        if jpeg is None:
+            raise HTTPException(status_code=404, detail="no frame yet")
+        return Response(
+            content=jpeg,
+            media_type="image/jpeg",
+            # Preview is inherently single-moment-in-time; any cache would
+            # make the UI feel stale.
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/recordings")
+    async def list_recordings() -> list[dict]:
+        return recorder.list_sessions()
+
+    @app.delete("/recordings/{name}")
+    async def delete_recording(name: str) -> dict:
+        if not _is_safe_leaf(name):
+            raise HTTPException(status_code=400, detail="invalid session name")
+        try:
+            existed = recorder.delete_session(name)
+        except RuntimeError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        if not existed:
+            raise HTTPException(status_code=404, detail="session not found")
+        return {"deleted": name}
+
+
+def _register_live_routes(app: FastAPI, live: LiveFrameStore) -> None:
+    """Always-on per-uav live preview, independent of `Recorder` state.
+
+    Lets an operator open the /demo page and see exactly what each
+    connected client (eg manna-dash, replay script) is currently feeding
+    into /detect — without needing to start a recording session.
+    """
+
+    @app.get("/live/preview")
+    async def live_preview_list() -> list[dict]:
+        return live.list()
+
+    @app.get("/live/preview/{uav_id}")
+    async def live_preview_jpeg(uav_id: str) -> Response:
+        jpeg = live.get_jpeg(uav_id)
+        if jpeg is None:
+            raise HTTPException(status_code=404, detail="no frame yet")
+        return Response(
+            content=jpeg,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.delete("/live/preview")
+    async def live_preview_clear() -> dict:
+        live.clear()
+        return {"cleared": True}
 
 
 def _register_demo_routes(app: FastAPI, config: Config) -> None:
@@ -249,8 +446,14 @@ def _resolve_sample_dir(raw: str) -> Path | None:
     return p
 
 
-def _decode_frame(raw: bytes, reply) -> FrameJob:
-    """Parse a binary WS message. See module docstring for the envelope."""
+def _decode_frame(raw: bytes, reply) -> tuple[FrameJob, bool]:
+    """Parse a binary WS message. See module docstring for the envelope.
+
+    Returns the FrameJob plus the optional ``isDemo`` flag from the header.
+    The flag is consumed by the WS handler (to keep synthetic frames out of
+    the live monitor / recorder) and is not propagated into the inference
+    worker, which doesn't care where a frame came from.
+    """
     if len(raw) < HEADER_LEN_STRUCT.size:
         raise ValueError("frame shorter than header length prefix")
     (header_len,) = HEADER_LEN_STRUCT.unpack_from(raw, 0)
@@ -275,10 +478,11 @@ def _decode_frame(raw: bytes, reply) -> FrameJob:
         raise ValueError(f"missing/invalid header field: {e}") from e
     if not jpeg:
         raise ValueError("empty JPEG payload")
+    is_demo = bool(header.get("isDemo", False))
     # Telemetry is optional — a client that can't or doesn't want to send it
     # omits the key entirely and nothing downstream changes.
     telemetry = parse_telemetry(header.get("telemetry"))
-    return FrameJob(
+    job = FrameJob(
         uav_id=uav_id,
         ts_ms=ts_ms,
         is_low_light=is_low_light,
@@ -288,3 +492,4 @@ def _decode_frame(raw: bytes, reply) -> FrameJob:
         reply=reply,
         telemetry=telemetry,
     )
+    return job, is_demo
