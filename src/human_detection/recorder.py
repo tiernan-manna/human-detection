@@ -115,6 +115,7 @@ class RecorderStatus:
     bytes_written: int = 0
     per_uav_counts: dict[str, int] = field(default_factory=dict)
     excluded_uavs: list[str] = field(default_factory=list)
+    results_recorded: int = 0
 
 
 class Recorder:
@@ -141,12 +142,24 @@ class Recorder:
         # Open file handle to frames.jsonl, kept for the life of the
         # session to amortise the open() cost and guarantee line ordering.
         self._jsonl_fh = None
+        # Sibling file holding what the LIVE detector returned for each
+        # captured frame, paired by seq. Lets us go back after a flight
+        # and diff "what the live config saw" against any other config
+        # we like in replay. Append-only and synchronous, see
+        # record_result for the rationale.
+        self._results_jsonl_path: Optional[Path] = None
+        self._results_jsonl_fh = None
+        self._results_recorded = 0
 
         self._seq = 0
         self._frames_captured = 0
         self._frames_dropped = 0
         self._bytes_written = 0
         self._per_uav_counts: dict[str, int] = {}
+        # Tracked separately so the post-session manifest can advertise
+        # whether the recording is useful for replay-mode load tests
+        # (which need telemetry to exercise the altitude/hover gates).
+        self._frames_with_telemetry = 0
         self._started_at_ms: Optional[int] = None
         # Latest captured frame per uavId, held in memory so the UI can
         # render a live preview while recording. Stale entries from a
@@ -194,6 +207,7 @@ class Recorder:
             bytes_written=self._bytes_written,
             per_uav_counts=dict(self._per_uav_counts),
             excluded_uavs=sorted(self._excluded_uavs),
+            results_recorded=self._results_recorded,
         )
 
     def selection(self) -> dict[str, Any]:
@@ -257,6 +271,7 @@ class Recorder:
         self._frames_dir = frames_dir
         self._manifest_path = session_dir / "manifest.json"
         self._jsonl_path = session_dir / "frames.jsonl"
+        self._results_jsonl_path = session_dir / "live_results.jsonl"
         self._session_name = dir_name
         self._started_at_ms = int(started.timestamp() * 1000)
         self._seq = 0
@@ -264,6 +279,8 @@ class Recorder:
         self._frames_dropped = 0
         self._bytes_written = 0
         self._per_uav_counts = {}
+        self._frames_with_telemetry = 0
+        self._results_recorded = 0
         self._latest_preview = {}
         self._warned_no_telemetry = set()
 
@@ -282,6 +299,9 @@ class Recorder:
         self._manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
 
         self._jsonl_fh = self._jsonl_path.open("a", encoding="utf-8")
+        self._results_jsonl_fh = self._results_jsonl_path.open(
+            "a", encoding="utf-8"
+        )
 
         # Drain any stale items from the queue — defensive; the caller
         # should never be able to produce these but it's cheap to be sure.
@@ -326,6 +346,13 @@ class Recorder:
             except Exception:
                 log.exception("closing frames.jsonl failed")
             self._jsonl_fh = None
+        if self._results_jsonl_fh is not None:
+            try:
+                self._results_jsonl_fh.flush()
+                self._results_jsonl_fh.close()
+            except Exception:
+                log.exception("closing live_results.jsonl failed")
+            self._results_jsonl_fh = None
 
         # Append a summary block to the manifest so consumers don't have
         # to count lines in frames.jsonl to know what's there.
@@ -345,6 +372,8 @@ class Recorder:
             manifest["frames_dropped"] = self._frames_dropped
             manifest["bytes_written"] = self._bytes_written
             manifest["per_uav_counts"] = dict(self._per_uav_counts)
+            manifest["frames_with_telemetry"] = self._frames_with_telemetry
+            manifest["results_recorded"] = self._results_recorded
             self._manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
 
         status = self.status()
@@ -360,6 +389,7 @@ class Recorder:
         self._session_dir = None
         self._frames_dir = None
         self._jsonl_path = None
+        self._results_jsonl_path = None
         self._manifest_path = None
         return status
 
@@ -372,22 +402,28 @@ class Recorder:
         img_h: int,
         jpeg: bytes,
         telemetry: Optional[dict[str, Any]] = None,
-    ) -> None:
+    ) -> Optional[int]:
         """Enqueue one frame. Non-blocking.
 
         Safe to call from the WS handler (which is already async); if the
         queue is full we drop *this* frame rather than back-pressure the
         client. Drops are counted in status() and logged.
+
+        Returns the assigned sequence number when the frame is captured
+        (so the caller can pair the upcoming live detection result with
+        this exact frame via :meth:`record_result`). Returns ``None``
+        when the recorder is idle or the drone is excluded — those
+        frames have no presence in the recording at all.
         """
         if not self._active:
-            return
+            return None
         # Per-uav opt-out is checked before we touch any session state so
         # an excluded drone leaves no trace at all — no seq bump, no
         # per-uav counter, no preview entry. That keeps the recording
         # exactly equivalent to having only ever pointed the relevant
         # drones at the sidecar.
         if uav_id in self._excluded_uavs:
-            return
+            return None
         if not telemetry and uav_id not in self._warned_no_telemetry:
             log.warning(
                 "uav=%s sending frames with no telemetry attached — altitude "
@@ -429,6 +465,62 @@ class Recorder:
             img_h=img_h,
             jpeg=jpeg,
         )
+        return cap.seq
+
+    def record_result(
+        self,
+        seq: int,
+        uav_id: str,
+        client_ts_ms: int,
+        inference_ms: float,
+        detections: list[dict[str, Any]],
+        dropped: bool = False,
+    ) -> None:
+        """Append the live detector's reply for an already-captured frame.
+
+        Pairs with :meth:`capture` via the ``seq`` returned there. The
+        record lives in a sibling ``live_results.jsonl`` file rather than
+        being merged into ``frames.jsonl``, for two reasons:
+
+        - ``frames.jsonl`` is appended exactly once per frame from the
+          writer task; mutating those lines after the fact would risk
+          torn writes on crash.
+        - Keeping results separate means an old recording (from before
+          this method existed) is still fully usable and a new replay
+          script can opt-in to joining the two files on ``seq``.
+
+        Each line carries everything needed for an offline diff against
+        a different model / threshold: the inference time the live
+        detector took, the detection list as the dashboard saw it, and
+        whether the worker had to drop the frame under load.
+
+        Quietly no-ops if recording isn't active or the seq is unknown
+        — the caller (the WS reply wrapper) shouldn't have to care
+        about race conditions around stop_session.
+        """
+        if not self._active or self._results_jsonl_fh is None:
+            return
+        record = {
+            "seq": int(seq),
+            "uav_id": uav_id,
+            "client_ts": int(client_ts_ms),
+            "received_at": int(time.time() * 1000),
+            "inference_ms": round(float(inference_ms), 2),
+            "dropped": bool(dropped),
+            "detections": detections,
+        }
+        line = json.dumps(record) + "\n"
+        # Synchronous append: one record is ~150-300 bytes (a handful of
+        # detections at most), well below the cost of an asyncio task
+        # round-trip. The hot path is the WS reply, which is already
+        # awaiting send_text — adding one append+flush of that size
+        # is comparable noise.
+        try:
+            self._results_jsonl_fh.write(line)
+            self._results_jsonl_fh.flush()
+            self._results_recorded += 1
+        except Exception:
+            log.exception("failed to append live_results.jsonl line")
 
     def preview_list(self) -> list[dict[str, Any]]:
         """Metadata for every uav currently being recorded.
@@ -470,7 +562,14 @@ class Recorder:
         return frame.jpeg if frame else None
 
     def list_sessions(self) -> list[dict[str, Any]]:
-        """Enumerate recorded sessions for the /recordings endpoint."""
+        """Enumerate recorded sessions for the /recordings endpoint.
+
+        Each entry is annotated with ``frames_with_telemetry`` so the
+        demo UI can filter to sessions that will actually exercise the
+        telemetry-driven gates (altitude window, hover boost, motion
+        gate). For sessions captured before this annotation existed we
+        derive the count cheaply by scanning ``frames.jsonl``.
+        """
         if not self._base_dir.is_dir():
             return []
         out: list[dict[str, Any]] = []
@@ -484,8 +583,11 @@ class Recorder:
                     manifest.update(json.loads(manifest_path.read_text()))
                 except json.JSONDecodeError:
                     pass
-            # `config_snapshot` is noisy; omit from the summary listing.
             manifest.pop("config_snapshot", None)
+            if "frames_with_telemetry" not in manifest:
+                manifest["frames_with_telemetry"] = _count_telemetry_frames(
+                    d / "frames.jsonl"
+                )
             out.append(manifest)
         return out
 
@@ -533,11 +635,7 @@ class Recorder:
                 break
             try:
                 await asyncio.to_thread(self._write_one, cap)
-                self._frames_captured += 1
-                self._bytes_written += len(cap.jpeg)
-                self._per_uav_counts[cap.uav_id] = (
-                    self._per_uav_counts.get(cap.uav_id, 0) + 1
-                )
+                self._account_for(cap)
             except Exception:
                 log.exception("recorder write failed for seq=%d", cap.seq)
 
@@ -551,13 +649,18 @@ class Recorder:
                 continue
             try:
                 await asyncio.to_thread(self._write_one, cap)
-                self._frames_captured += 1
-                self._bytes_written += len(cap.jpeg)
-                self._per_uav_counts[cap.uav_id] = (
-                    self._per_uav_counts.get(cap.uav_id, 0) + 1
-                )
+                self._account_for(cap)
             except Exception:
                 log.exception("recorder drain-write failed for seq=%d", cap.seq)
+
+    def _account_for(self, cap: _FrameCapture) -> None:
+        self._frames_captured += 1
+        self._bytes_written += len(cap.jpeg)
+        self._per_uav_counts[cap.uav_id] = (
+            self._per_uav_counts.get(cap.uav_id, 0) + 1
+        )
+        if cap.telemetry:
+            self._frames_with_telemetry += 1
 
     def _write_one(self, cap: _FrameCapture) -> None:
         assert self._frames_dir is not None
@@ -582,6 +685,33 @@ class Recorder:
         # leaves a fully-parseable jsonl (no half-written line).
         self._jsonl_fh.write(json.dumps(record) + "\n")
         self._jsonl_fh.flush()
+
+
+def _count_telemetry_frames(jsonl_path: Path) -> int:
+    """Cheap scan of a session's frames.jsonl for the count of frames
+    that carry a non-empty ``telemetry`` object. Used to back-fill
+    legacy manifests from before we tracked this number live.
+    Returns 0 if the file is missing or unparseable — matches the
+    ``no telemetry attached`` semantics the demo cares about.
+    """
+    if not jsonl_path.is_file():
+        return 0
+    n = 0
+    try:
+        with jsonl_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("telemetry"):
+                    n += 1
+    except OSError:
+        return 0
+    return n
 
 
 def _is_safe_leaf(name: str) -> bool:
