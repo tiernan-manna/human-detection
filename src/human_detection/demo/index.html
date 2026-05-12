@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>Human Detection Sidecar — Demo</title>
-  <link rel="stylesheet" href="/demo/demo.css?v=replay-window-1" />
+  <link rel="stylesheet" href="/demo/demo.css?v=imgsz-pipeline-1" />
 </head>
 <body>
   <header>
@@ -64,6 +64,14 @@
       <div class="stat" title="The detection model loaded by the sidecar. Larger models (yolov8l) are more accurate but slower than smaller ones (yolov8n/s/m).">
         <span class="stat-label">model</span>
         <span class="stat-value stat-value-small" id="stat-model">—</span>
+      </div>
+      <div class="stat" title="Inference resolution: ultralytics letterboxes the source frame to this size before the YOLO forward pass. WALDO is trained at 640; raising to 1280/1920 typically lifts recall on small/distant people at the cost of ~3-4× latency. Configured via HUMAN_DETECTION_IMGSZ.">
+        <span class="stat-label">imgsz</span>
+        <span class="stat-value stat-value-small" id="stat-imgsz">—</span>
+      </div>
+      <div class="stat" title="Detector pipeline: 'single' = one forward pass per frame (fast). 'sahi' = sliced inference over overlapping tiles (better recall on small objects, ~Nx slower). Configured via HUMAN_DETECTION_DETECTOR.">
+        <span class="stat-label">pipeline</span>
+        <span class="stat-value stat-value-small" id="stat-pipeline">—</span>
       </div>
     </div>
 
@@ -179,6 +187,6 @@
     </span>
   </footer>
 
-  <script src="/demo/demo.js?v=replay-window-1"></script>
+  <script src="/demo/demo.js?v=imgsz-pipeline-1"></script>
 </body>
 </html>

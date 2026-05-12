@@ -16,6 +16,7 @@ transparently so the same code works on M3 locally and EC2 later.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,8 @@ import supervision as sv
 
 from human_detection.config import Config
 from human_detection.model_download import ensure_model
+
+log = logging.getLogger(__name__)
 
 # Default SAHI tile size in pixels. Smaller = more tiles = better small-object
 # recall but slower. 320 is a good starting point for 640x640 trained models.
@@ -100,6 +103,13 @@ class WaldoDetector:
         self._model = None
         self._class_names: dict[int, str] = {}
         self._target_class_ids: set[int] | None = None
+        # Inference-time letterbox size. Defaults to the model's training
+        # resolution (640 for WALDO) but can be raised to 1280/1920 to
+        # gain recall on small objects when source frames are tiny —
+        # e.g. a 320x240 drone feed where a person is only ~10-20px and
+        # WALDO's default 640x640 still leaves them at the bottom of
+        # YOLO's reliable detection range.
+        self._imgsz = max(32, int(config.inference_imgsz))
 
     def _load(self) -> None:
         if self._model is not None:
@@ -129,6 +139,7 @@ class WaldoDetector:
             source=frame,
             conf=self._config.confidence_threshold,
             device=self._device,
+            imgsz=self._imgsz,
             verbose=False,
         )
         detections = sv.Detections.from_ultralytics(results[0])
@@ -159,12 +170,17 @@ class WaldoDetector:
         from a background thread at startup."""
         self._load()
         assert self._model is not None
-        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        # Use the configured imgsz so the warmup compiles the same kernels
+        # the live path will hit. A 640-warmed model still works at 1280
+        # but the first 1280 frame eats the JIT cost.
+        side = self._imgsz
+        dummy = np.zeros((side, side, 3), dtype=np.uint8)
         for _ in range(max(1, rounds)):
             self._model.predict(
                 source=dummy,
                 conf=self._config.confidence_threshold,
                 device=self._device,
+                imgsz=self._imgsz,
                 verbose=False,
             )
 
@@ -212,6 +228,30 @@ class SahiDetector:
             confidence_threshold=self._config.confidence_threshold,
             device=self._device,
         )
+
+    def warmup(self, rounds: int = 1) -> None:
+        """Eat the SAHI + ultralytics one-time JIT cost on a dummy frame.
+
+        SAHI's per-tile inference still goes through the same YOLO model
+        as the single-pass path, so a single warm-up call materially
+        reduces the first real frame's latency. We use only one round by
+        default because each SAHI call is already several tile inferences
+        — the goal is just to load weights and trigger compilation.
+        """
+        self._load()
+        # Build a frame big enough to produce at least one tile under the
+        # configured slice size, otherwise SAHI degenerates to a single
+        # whole-image inference and the warm-up doesn't compile the
+        # tiling kernels we're about to use.
+        side = max(self._slice_size * 2, 32)
+        dummy = np.zeros((side, side, 3), dtype=np.uint8)
+        for _ in range(max(1, rounds)):
+            try:
+                self.detect(dummy)
+            except Exception:
+                # Warmup is best-effort; never let it kill startup.
+                log.exception("sahi warmup failed (non-fatal)")
+                break
 
     def detect(self, frame: np.ndarray) -> sv.Detections:
         self._load()

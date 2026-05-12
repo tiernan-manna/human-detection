@@ -134,6 +134,38 @@ class Config:
     # for the detection to pass the motion gate.
     hover_motion_box_fraction: float = 0.02
 
+    # --- Inference resolution ----------------------------------------------
+    # Forwarded to ultralytics' `model.predict(imgsz=...)`. The detector
+    # letterboxes the source frame up to this size before the forward
+    # pass — bigger = more pixels per detection = better recall on small
+    # objects (people seen from altitude), at a roughly quadratic cost in
+    # latency. WALDO is trained at 640×640 so 640 is the sweet spot for
+    # accuracy/throughput parity; raising to 1280 or 1920 visibly helps
+    # detection of distant/tiny humans on low-resolution source feeds
+    # (e.g. 320×240) at ~3-4× the per-frame cost. Set per deployment.
+    inference_imgsz: int = 640
+
+    # --- Detector selection ------------------------------------------------
+    # "single" = one forward pass per frame (fast, matches WALDO's training
+    # resolution). "sahi"   = sliced inference via SAHI; runs the model on
+    # overlapping tiles of the frame and merges with NMS, dramatically
+    # better recall on tiny objects but ~Nx slower (where N is roughly the
+    # tile count). SAHI only pays off when the SOURCE frame is meaningfully
+    # larger than the model's training res — at 320×240 source there's
+    # nothing to slice, so SAHI is mostly relevant once upstream resolution
+    # is fixed. Validated at startup; an unknown value raises.
+    detector_kind: str = "single"
+    # SAHI tile size in pixels. 320 is a good starting point for the
+    # 640×640 WALDO model (each tile is "natively" sized for the network
+    # input, no internal letterboxing). Smaller = more tiles = better
+    # small-object recall but more inference passes per frame.
+    sahi_slice_size: int = 320
+    # Fractional overlap between adjacent SAHI tiles. Some overlap is
+    # required so a person straddling a tile boundary is captured by at
+    # least one whole tile. 0.2 = 20% overlap each side; the post-pass
+    # NMS dedupes the resulting overlapping boxes.
+    sahi_slice_overlap: float = 0.2
+
     # --- Recording / archiving ---------------------------------------------
     # Directory where /record/* endpoints write recorded sessions. Relative
     # paths resolve against the sidecar CWD (usually the repo root via
@@ -211,6 +243,16 @@ class Config:
                 os.getenv("HUMAN_DETECTION_HOVER_MOTION_FRAC", "0.02")
             ),
             recordings_dir=os.getenv("HUMAN_DETECTION_RECORDINGS_DIR", "recordings"),
+            inference_imgsz=int(
+                os.getenv("HUMAN_DETECTION_IMGSZ", "640")
+            ),
+            detector_kind=os.getenv("HUMAN_DETECTION_DETECTOR", "single"),
+            sahi_slice_size=int(
+                os.getenv("HUMAN_DETECTION_SAHI_SLICE_SIZE", "320")
+            ),
+            sahi_slice_overlap=float(
+                os.getenv("HUMAN_DETECTION_SAHI_SLICE_OVERLAP", "0.2")
+            ),
         )
 
 

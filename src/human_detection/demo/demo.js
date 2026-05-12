@@ -5,9 +5,9 @@
   // can confirm at a glance whether their browser is running the new
   // replay-mode code or a stale cached copy. If you don't see this log
   // after refreshing, your browser is serving stale demo.js from cache.
-  const DEMO_BUILD = "replay-window-1";
+  const DEMO_BUILD = "imgsz-pipeline-1";
   console.info(
-    `[demo] human-detection demo build=${DEMO_BUILD} — replay-mode w/ frame-window support active`
+    `[demo] human-detection demo build=${DEMO_BUILD} — imgsz + pipeline stats active`
   );
 
   const WS_URL =
@@ -100,6 +100,8 @@
     replaySummaryText: document.getElementById("replay-summary-text"),
     device: document.getElementById("stat-device"),
     model: document.getElementById("stat-model"),
+    imgsz: document.getElementById("stat-imgsz"),
+    pipeline: document.getElementById("stat-pipeline"),
     grid: document.getElementById("grid"),
     ctlTiles: document.getElementById("ctl-tiles"),
     ctlHz: document.getElementById("ctl-hz"),
@@ -664,6 +666,12 @@
       const h = await r.json();
       els.device.textContent = h.device || "—";
       els.model.textContent = (h.model || "—").replace(/\.pt$/, "");
+      if (els.imgsz) {
+        els.imgsz.textContent = h.imgsz ? String(h.imgsz) : "—";
+      }
+      if (els.pipeline) {
+        els.pipeline.textContent = h.detectorKind || "—";
+      }
     } catch (_e) {
       // health is cosmetic; skip on error
     }

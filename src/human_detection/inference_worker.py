@@ -39,7 +39,7 @@ import numpy as np
 import supervision as sv
 
 from human_detection.config import Config
-from human_detection.detector import WaldoDetector
+from human_detection.detector import SahiDetector, WaldoDetector
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +47,34 @@ log = logging.getLogger(__name__)
 # is way off; we round up to a floor of 1 so the predictor is at least not
 # biased toward sub-frame motion.
 _DEFAULT_FRAME_RATE_HZ = 1
+
+
+def _build_detector(config: Config) -> object:
+    """Pick the detector implementation per `config.detector_kind`.
+
+    "single" — fast, one forward pass per frame; matches WALDO's training
+               resolution and is the right default for live video.
+    "sahi"   — sliced inference; runs the model on overlapping tiles and
+               merges with NMS. Big recall win on small objects when the
+               source frame is well above the model's input res, at ~Nx
+               the per-frame cost (where N is roughly the tile count).
+
+    Raises ValueError on an unknown kind so a typo in env vars fails fast
+    at startup rather than silently falling back to a different mode.
+    """
+    kind = (config.detector_kind or "single").lower()
+    if kind == "single":
+        return WaldoDetector(config)
+    if kind == "sahi":
+        return SahiDetector(
+            config,
+            slice_size=config.sahi_slice_size,
+            slice_overlap=config.sahi_slice_overlap,
+        )
+    raise ValueError(
+        f"unknown detector_kind={config.detector_kind!r} "
+        f"(expected one of: 'single', 'sahi')"
+    )
 
 
 @dataclass
@@ -178,6 +206,8 @@ class InferenceWorker:
             inference_threshold = min(
                 config.confidence_threshold, config.low_light_conf_threshold
             )
+        # Pass through every detector-relevant knob so a SAHI run sees the
+        # same min-box / aspect / imgsz config a single-pass run would.
         detector_config = Config(
             enabled=True,
             model_name=config.model_name,
@@ -185,8 +215,14 @@ class InferenceWorker:
             target_classes=config.target_classes,
             device=config.device,
             min_box_fraction=config.min_box_fraction,
+            aspect_ratio_min=config.aspect_ratio_min,
+            aspect_ratio_max=config.aspect_ratio_max,
+            inference_imgsz=config.inference_imgsz,
+            detector_kind=config.detector_kind,
+            sahi_slice_size=config.sahi_slice_size,
+            sahi_slice_overlap=config.sahi_slice_overlap,
         )
-        self._detector = detector or WaldoDetector(detector_config)
+        self._detector = detector or _build_detector(detector_config)
         # dict[uav_id, FrameJob] acting as the drop-old queue. A secondary
         # asyncio.Event unblocks the consumer when new work arrives.
         self._pending: dict[str, FrameJob] = {}

@@ -156,6 +156,12 @@ def create_app(
             "device": _pick_device(effective_config.device),
             "model": effective_config.model_name,
             "version": app.version,
+            # Surfaced so the demo's stats row can show "running at
+            # imgsz=1280 (sahi)" — operators tweaking these knobs to
+            # trade accuracy for latency want to see at a glance which
+            # mode is live, not have to grep server logs.
+            "detectorKind": effective_config.detector_kind,
+            "imgsz": effective_config.inference_imgsz,
         }
 
     @app.get("/config")
@@ -171,6 +177,10 @@ def create_app(
             "targetClasses": list(c.target_classes),
             "minBoxFraction": c.min_box_fraction,
             "maxConcurrentStreams": c.max_concurrent_streams,
+            "detectorKind": c.detector_kind,
+            "imgsz": c.inference_imgsz,
+            "sahiSliceSize": c.sahi_slice_size,
+            "sahiSliceOverlap": c.sahi_slice_overlap,
         }
 
     @app.websocket("/detect")
