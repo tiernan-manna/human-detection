@@ -3,8 +3,11 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
   <title>Human Detection Sidecar — Demo</title>
-  <link rel="stylesheet" href="/demo/demo.css" />
+  <link rel="stylesheet" href="/demo/demo.css?v=replay-window-1" />
 </head>
 <body>
   <header>
@@ -18,15 +21,19 @@
         <span class="stat-label">tiles</span>
         <span class="stat-value" id="stat-tiles">0</span>
       </div>
-      <div class="stat" title="Frames per second the demo is SENDING into the sidecar across all tiles (tiles × rate Hz). This is the demand.">
+      <div class="stat" title="Frames per second the demo is SENDING into the sidecar across all tiles (tiles × rate Hz). This is the demand the test is putting on the sidecar.">
         <span class="stat-label">fps in</span>
         <span class="stat-value" id="stat-fps-in">0.0</span>
       </div>
-      <div class="stat" title="Frames per second the sidecar RETURNED results for across all tiles over the last second. The real-world throughput. (fps in − fps out) is roughly what's being dropped.">
+      <div class="stat" title="Frames per second the sidecar RETURNED results for across all tiles over the last second. (fps in − fps out) is roughly what's being dropped right now.">
         <span class="stat-label">fps out</span>
         <span class="stat-value" id="stat-fps-out">0.0</span>
       </div>
-      <div class="stat" title="Average per-frame inference time over the last ~50 completed frames. This is how long ONE YOLO forward pass takes on your device. Theoretical max throughput = 1000 / avg_ms.">
+      <div class="stat" title="capacity fps ÷ fps in. >1 = sustainable load (the detector is keeping up with demand). <1 = the test is over-driving the hardware and the drop counter will climb. For the 10-drones-at-1Hz target you want this comfortably ≥ 1.5 to absorb p95 spikes.">
+        <span class="stat-label">headroom</span>
+        <span class="stat-value" id="stat-headroom">—</span>
+      </div>
+      <div class="stat" title="Average per-frame inference time over the last ~200 completed frames. This is how long ONE YOLO forward pass takes on your device. Theoretical max throughput = 1000 / avg_ms.">
         <span class="stat-label">avg ms</span>
         <span class="stat-value" id="stat-avg-ms">0</span>
       </div>
@@ -34,13 +41,21 @@
         <span class="stat-label">p95 ms</span>
         <span class="stat-value" id="stat-p95-ms">0</span>
       </div>
-      <div class="stat" title="Theoretical sustained throughput on this hardware = 1000 / avg_ms. Compare against 'fps in' (demand): if demand > capacity, frames are being dropped. If it's well above 10 on the pilot PC, 10 drones × 1 Hz has comfortable headroom.">
+      <div class="stat" title="Theoretical sustained throughput on this hardware = 1000 / avg_ms. If it's well above your fps in, the load is comfortably absorbed.">
         <span class="stat-label">capacity fps</span>
         <span class="stat-value" id="stat-capacity">—</span>
       </div>
-      <div class="stat" title="Cumulative count of frames the demo sent that never came back (sidecar dropped them because inference couldn't keep up). Per sidecar policy, the OLDEST pending frame for a uavId is always dropped first so video quality is never affected.">
+      <div class="stat" title="Frames currently in flight: sent to /detect but no reply yet. Should hover near 0 if the sidecar is keeping up; a steadily climbing number means the queue is backing up and drops are imminent.">
+        <span class="stat-label">in-flight</span>
+        <span class="stat-value" id="stat-inflight">0</span>
+      </div>
+      <div class="stat" title="Cumulative drops across all tiles since 'reset stats'. Per sidecar policy the OLDEST pending frame for a uavId is dropped first, so video quality is unaffected; non-zero just means inference couldn't keep up at some point.">
         <span class="stat-label">drops</span>
         <span class="stat-value" id="stat-drops">0</span>
+      </div>
+      <div class="stat" title="Person detections per second the sidecar returned across all tiles, averaged over the last second. Confirms the detector is doing real work — if it's 0 while the recording obviously contains people, the altitude/hover gates are filtering frames out (check the per-tile dets badge).">
+        <span class="stat-label">dets/s</span>
+        <span class="stat-value" id="stat-dets-rate">0</span>
       </div>
       <div class="stat" title="Hardware backend the sidecar is running inference on. mps = Apple GPU, cuda = Nvidia GPU, cpu = fallback (much slower).">
         <span class="stat-label">device</span>
@@ -52,14 +67,31 @@
       </div>
     </div>
 
+    <div id="replay-summary" class="replay-summary" hidden
+         title="Snapshot of what's currently being replayed. 'streams' is the number of distinct (recording, uavId) sources the tiles are cycling through; with N > streams the tiles round-robin and start at staggered offsets. JPEG cache is bounded at ~200 MB with LRU eviction.">
+      <span class="replay-summary-label">replay</span>
+      <span id="replay-summary-text">—</span>
+    </div>
+
     <div class="controls-row">
+      <label title="What each tile sends to the sidecar. 'still images' = cycle the bundled sample_images/ folder (good for a quick visual sanity check). 'recording' = replay a captured session, with original telemetry + isLowLight intact (good for honest performance tests of the gates and tracker on real footage).">
+        source
+        <select id="ctl-source">
+          <option value="still">still images</option>
+          <option value="recording">recording</option>
+        </select>
+      </label>
+      <label id="ctl-recording-wrap" hidden title="Which captured session(s) to replay. 'all telemetry recordings' fans every usable session into the tile pool so e.g. 3 recordings + 10 tiles gives you 3 distinct videos playing across 10 virtual UAVs (round-robin with staggered start offsets). Pick a single recording to replay just that one. Only sessions that carry telemetry are listed; without telemetry the altitude/hover/motion gates are silently disabled which makes the throughput numbers misleading.">
+        recording(s)
+        <select id="ctl-recording"></select>
+      </label>
       <label title="How many simulated drones to run. Each tile is an independent uavId sending its own frames. Default is 0 \u2014 the sidecar processes nothing from the demo until you raise this. Live drone footage from manna-dash is unaffected and continues to flow regardless.">
         tiles (test mode)
         <input type="number" id="ctl-tiles" min="0" max="30" value="0" />
       </label>
-      <label title="How often each tile sends a frame. Production target is 1 Hz per drone. Higher rates just stress-test the sidecar; the pilot dashboard will never send faster than 1 Hz.">
+      <label title="How often each tile sends a frame. Production default is 1 Hz per drone but the pilot dashboard now exposes 1–30 Hz, so this control matches that range to mirror real-flight conditions. Stress-testing at 30 Hz with 10 tiles is a 300 fps load and almost certainly over capacity — watch headroom.">
         rate (Hz)
-        <input type="number" id="ctl-hz" min="0.2" max="5" step="0.1" value="1" />
+        <input type="number" id="ctl-hz" min="1" max="30" step="1" value="1" />
       </label>
       <label class="checkbox" title="Sets the `isLowLight` flag on outgoing frames. The sidecar uses a lower confidence threshold when this is true, mimicking the sunset→sunrise window in the real dashboard.">
         <input type="checkbox" id="ctl-low-light" />
@@ -71,12 +103,36 @@
       </label>
       <button id="ctl-pause" type="button" title="Stop sending new frames to the sidecar. Already-pending inferences still come back, but no new work is queued.">pause</button>
       <button id="ctl-reset" type="button" title="Zero out the avg/p95/drops counters. The sidecar itself is untouched.">reset stats</button>
+      <span id="replay-status" class="rec-state" hidden
+            title="Progress of the replay-mode preload: the demo fetches the recording's JPEGs once into the browser cache so the send loop never blocks on disk I/O. Once it says ready, throughput numbers reflect pure detector + WS overhead."></span>
       <span class="rec-group">
         <button id="ctl-record" type="button" class="record-btn"
                 title="Start/stop archiving every frame the sidecar receives (from any client, including manna-dash). Recorded sessions land under `recordings/` and can be replayed with scripts/replay_recording.py.">● record</button>
         <span id="rec-state" class="rec-state"
               title="Current recording state. While active, shows frame count and any drops caused by a slow disk.">idle</span>
       </span>
+    </div>
+
+    <div id="replay-window" class="replay-window-row" hidden
+         title="Restrict the replay loop to a specific seq range so testing focuses on the interesting frames (e.g. only the part of the recording where a human is on-camera). Applies when a single recording is selected; in 'all telemetry recordings' mode each source replays its full range.">
+      <span class="replay-window-label">frame window</span>
+      <label title="First frame seq to include in the replay loop. The recording's frames are numbered from 1; the live_results.jsonl uses the same seq numbers so you can match a window to detection logs.">
+        start
+        <input type="number" id="ctl-window-start" min="1" step="1" />
+      </label>
+      <label title="Last frame seq to include in the replay loop, inclusive. Set equal to start to loop a single frame.">
+        end
+        <input type="number" id="ctl-window-end" min="1" step="1" />
+      </label>
+      <button id="ctl-window-fit" type="button"
+              title="Auto-fit the window to the seq range that produced detections during the original recording (read from live_results.jsonl). Quickest way to focus testing on the frames where a human was actually visible.">
+        fit to detections
+      </button>
+      <button id="ctl-window-reset" type="button"
+              title="Reset the window to cover every recorded frame.">
+        reset
+      </button>
+      <span id="replay-window-status" class="replay-window-status">—</span>
     </div>
     <div id="live-preview" class="rec-preview"
          title="Latest frame received per uavId on /detect, regardless of recording state. Updates every 2 s. Use this to confirm a connected client (eg manna-dash, the SITL replay script) is actually sending frames.">
@@ -109,19 +165,20 @@
 
   <footer>
     <span>
-      This demo cycles through the images in the sidecar's
-      <code>sample_images/</code> folder and runs each one through
-      <code>/detect</code> at the configured rate. Red boxes are drawn from
-      whatever the sidecar returns. No video — these are static test images.
-      <br />
-      <strong>Note:</strong> this page is a <em>client</em> of the sidecar,
-      not its own detector. Opening it in multiple tabs (or running it
-      alongside manna-dash) sends that many times more frames to the
-      <em>same</em> sidecar process, so throughput numbers degrade because
-      demand stacks, not because anything is duplicated.
+      This page is a <em>client</em> of the sidecar, not its own detector.
+      It synthesises load by sending frames into <code>/detect</code> at
+      the configured rate. Use <strong>source = still images</strong> to
+      cycle the bundled <code>sample_images/</code> folder for a quick
+      visual sanity check, or <strong>source = recording</strong> to
+      replay a captured session — original telemetry and low-light flags
+      are forwarded so the altitude gate, hover boost and motion gate
+      behave exactly as they did in flight. Frames sent from this page
+      are flagged <code>isDemo</code> and never appear in the live
+      monitor or recordings; running it alongside manna-dash just stacks
+      demand on the same sidecar process.
     </span>
   </footer>
 
-  <script src="/demo/demo.js"></script>
+  <script src="/demo/demo.js?v=replay-window-1"></script>
 </body>
 </html>
