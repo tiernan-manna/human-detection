@@ -162,6 +162,9 @@ def create_app(
             # mode is live, not have to grep server logs.
             "detectorKind": effective_config.detector_kind,
             "imgsz": effective_config.inference_imgsz,
+            # Lets the demo overlay decide whether to bother fetching /
+            # rendering the rawDetections array on every reply.
+            "debugRaw": effective_config.debug_emit_raw_detections,
         }
 
     @app.get("/config")
@@ -181,6 +184,7 @@ def create_app(
             "imgsz": c.inference_imgsz,
             "sahiSliceSize": c.sahi_slice_size,
             "sahiSliceOverlap": c.sahi_slice_overlap,
+            "debugEmitRawDetections": c.debug_emit_raw_detections,
         }
 
     @app.websocket("/detect")

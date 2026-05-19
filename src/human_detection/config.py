@@ -11,7 +11,18 @@ import os
 from dataclasses import dataclass, field
 
 
-DEFAULT_MODEL = "WALDO30_yolov8l_640x640.pt"
+# `-p2` denotes the small-object detection-head variant of WALDO30. The
+# vanilla yolov8l model has detection heads at strides 8 / 16 / 32; -p2
+# adds a stride-4 head, which is materially better at the 12-30 px-tall
+# people we see at typical delivery altitudes on a 320x240 source feed.
+# Stephan (WALDO author) was explicit: "you definitely need to use the
+# -p2 model variants, those are way better at small objects like people".
+# Drop-in replacement at the same 640x640 training resolution, ~+15%
+# inference cost vs the non-p2 yolov8l. For maximum recall on small
+# targets, override to `WALDO30_yolov8l-p2_1024x1024.pt` AND set
+# `HUMAN_DETECTION_IMGSZ=1024` so the model runs at the resolution it
+# was trained at — see Config.inference_imgsz docstring.
+DEFAULT_MODEL = "WALDO30_yolov8l-p2_640x640.pt"
 DEFAULT_TARGET_CLASSES: tuple[str, ...] = ("Person",)
 
 
@@ -137,12 +148,24 @@ class Config:
     # --- Inference resolution ----------------------------------------------
     # Forwarded to ultralytics' `model.predict(imgsz=...)`. The detector
     # letterboxes the source frame up to this size before the forward
-    # pass — bigger = more pixels per detection = better recall on small
-    # objects (people seen from altitude), at a roughly quadratic cost in
-    # latency. WALDO is trained at 640×640 so 640 is the sweet spot for
-    # accuracy/throughput parity; raising to 1280 or 1920 visibly helps
-    # detection of distant/tiny humans on low-resolution source feeds
-    # (e.g. 320×240) at ~3-4× the per-frame cost. Set per deployment.
+    # pass (aspect ratio preserved with grey padding — never naively
+    # squished to a square; see WaldoDetector.detect for the contract).
+    # Bigger imgsz = more pixels per detection = better recall on small
+    # objects (people seen from altitude), at a roughly quadratic cost
+    # in latency.
+    #
+    # The default WALDO model (yolov8l-p2 @ 640x640) is trained at 640
+    # so that's the sweet spot for accuracy/throughput parity. Two
+    # higher-recall opt-ins for low-resolution feeds (e.g. 320x240
+    # delivery streams where people are 12-30 px tall):
+    #   1. Cheap: keep the 640-trained model, raise imgsz to 1280 or
+    #      1920. Ultralytics will infer at the larger size with a small
+    #      accuracy hit from running off-distribution.
+    #   2. Best: switch to `WALDO30_yolov8l-p2_1024x1024.pt` AND set
+    #      this to 1024. The model was trained natively at 1024 so
+    #      it hits the small-object regime where the -p2 head shines,
+    #      without the off-distribution penalty. ~2.5x slower than the
+    #      640 default — only viable if your hardware has the headroom.
     inference_imgsz: int = 640
 
     # --- Detector selection ------------------------------------------------
@@ -172,6 +195,18 @@ class Config:
     # start_sidecar.sh). Contains JPEG frames + telemetry JSONL — do NOT
     # commit; the .gitignore already excludes it.
     recordings_dir: str = "recordings"
+
+    # --- Debug surfaces ----------------------------------------------------
+    # When enabled, every WS reply includes a `rawDetections` array with the
+    # detector's pre-gate output (post min-box / aspect / candidate-conf,
+    # but BEFORE the tracker, hover-motion, and track-length gates). The
+    # demo overlay draws those boxes in a contrasting style so an operator
+    # can A/B the gates against raw recall: dashed yellow box = "YOLO saw
+    # this but a gate dropped it". Off in production — adds a small wire
+    # cost per frame and is meaningless to the dashboard's overlay code.
+    # Pair with HUMAN_DETECTION_CANDIDATE_CONF=0.05 (or lower) to also see
+    # the very weak hits that the candidate floor would otherwise hide.
+    debug_emit_raw_detections: bool = False
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -252,6 +287,9 @@ class Config:
             ),
             sahi_slice_overlap=float(
                 os.getenv("HUMAN_DETECTION_SAHI_SLICE_OVERLAP", "0.2")
+            ),
+            debug_emit_raw_detections=_env_bool(
+                "HUMAN_DETECTION_DEBUG_RAW", default=False
             ),
         )
 

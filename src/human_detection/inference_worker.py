@@ -137,6 +137,28 @@ class Detection:
 
 
 @dataclass
+class GateCounts:
+    """Per-stage detection counts for one frame.
+
+    Surfaced via the per-frame log line so an operator can tell at a glance
+    whether YOLO produced no candidates at all (a recall problem to fix
+    upstream — typically resolution or model choice) or whether candidates
+    *did* exist but the temporal gates dropped them (a tuning problem to
+    fix here — motion gate / track-length gate / aspect / min-box).
+
+    `raw` is the count returned by the detector itself (already past its
+    own confidence floor, min-box, and aspect filters). The remaining
+    fields are the survivor counts after each gate runs in pipeline
+    order; whichever gate first drops a detection is the one to look at.
+    """
+
+    raw: int = 0
+    after_track: int = 0
+    after_motion: int = 0
+    after_length: int = 0
+
+
+@dataclass
 class DetectionResult:
     uav_id: str
     ts_ms: int
@@ -145,9 +167,20 @@ class DetectionResult:
     detections: list[Detection]
     inference_ms: float
     dropped: bool = False
+    # Pre-gate detections from the detector. Empty unless
+    # `Config.debug_emit_raw_detections` is set, in which case they ride
+    # along on the WS reply so the demo overlay can draw "what YOLO saw"
+    # alongside "what passed the gates". Kept separate from `detections`
+    # so production clients (manna-dash) keep getting the same payload
+    # they always have.
+    raw_detections: list[Detection] = field(default_factory=list)
+    # Per-stage detection counts for diagnostic logging. Not serialised
+    # into the wire reply by default (clients don't need it; one log
+    # line per frame is the right surface).
+    gate_counts: GateCounts = field(default_factory=GateCounts)
 
     def to_dict(self) -> dict:
-        return {
+        out: dict[str, Any] = {
             "uavId": self.uav_id,
             "ts": self.ts_ms,
             "imgW": self.img_w,
@@ -155,6 +188,13 @@ class DetectionResult:
             "inferenceMs": round(self.inference_ms, 1),
             "detections": [d.to_dict() for d in self.detections],
         }
+        # Only include the debug array when the operator opted in. Empty
+        # raw_detections vs. omission is not a meaningful distinction —
+        # leaving the key out keeps the wire format unchanged for
+        # production clients.
+        if self.raw_detections:
+            out["rawDetections"] = [d.to_dict() for d in self.raw_detections]
+        return out
 
 
 @dataclass
@@ -208,6 +248,8 @@ class InferenceWorker:
             )
         # Pass through every detector-relevant knob so a SAHI run sees the
         # same min-box / aspect / imgsz config a single-pass run would.
+        # (debug_emit_raw_detections is read off `self._config` directly so
+        # we deliberately don't propagate it here.)
         detector_config = Config(
             enabled=True,
             model_name=config.model_name,
@@ -314,13 +356,25 @@ class InferenceWorker:
                 tracked = sum(
                     1 for d in result.detections if d.track_id is not None
                 )
+                gc = result.gate_counts
+                # The gate-funnel form lets you tell at a glance whether
+                # the bottleneck is upstream of the gates (raw=0 means
+                # YOLO never saw anything, look at resolution / model)
+                # or in the gates themselves (raw=N drops to dets=0
+                # means a gate is dropping borderline detections —
+                # tune motion or track-length).
                 log.info(
-                    "uav=%s low_light=%s hover=%s threshold=%.2f dets=%d tracked=%d ms=%.1f",
+                    "uav=%s low_light=%s hover=%s threshold=%.2f "
+                    "raw=%d after_track=%d after_motion=%d after_length=%d "
+                    "tracked=%d ms=%.1f",
                     job.uav_id,
                     job.is_low_light,
                     hover,
                     threshold,
-                    len(result.detections),
+                    gc.raw,
+                    gc.after_track,
+                    gc.after_motion,
+                    gc.after_length,
                     tracked,
                     result.inference_ms,
                 )
@@ -354,12 +408,24 @@ class InferenceWorker:
 
         detections: sv.Detections = self._detector.detect(frame)
         h, w = frame.shape[:2]
+        # Snapshot the pre-gate detections for the optional debug channel
+        # before we mutate `detections` through the pipeline. Materialising
+        # the list eagerly only when the flag is set keeps the hot path
+        # allocation-free in production.
+        if self._config.debug_emit_raw_detections:
+            raw_detections = _detections_to_list(detections)
+        else:
+            raw_detections = []
+        gate_counts = GateCounts(raw=len(detections))
 
         state = self._update_uav_state(job)
         if self._config.tracking_enabled:
             detections = self._apply_tracker(detections, state, job.is_low_light)
+            gate_counts.after_track = len(detections)
             detections = self._apply_hover_motion_gate(detections, state, frame)
+            gate_counts.after_motion = len(detections)
             detections = self._apply_track_length_gate(detections, state)
+            gate_counts.after_length = len(detections)
         else:
             # No tracker — fall back to the old stateless confidence filter so
             # disabling tracking is a true A/B comparison. The motion gate
@@ -368,6 +434,12 @@ class InferenceWorker:
             detections = self._filter_confidence_stateless(
                 detections, job.is_low_light, state
             )
+            # Mirror the post-stateless-filter count into all three gate
+            # slots so the log line stays interpretable in the
+            # tracking-disabled A/B run too.
+            gate_counts.after_track = len(detections)
+            gate_counts.after_motion = len(detections)
+            gate_counts.after_length = len(detections)
         # Cache this frame's grayscale for the next motion-gate comparison.
         # Done after the gate runs so we always diff against the previous
         # frame, never the current one.
@@ -382,6 +454,8 @@ class InferenceWorker:
             img_h=h,
             detections=dets_out,
             inference_ms=(time.monotonic() - t0) * 1000,
+            raw_detections=raw_detections,
+            gate_counts=gate_counts,
         )
 
     # ------------------------------------------------------------------

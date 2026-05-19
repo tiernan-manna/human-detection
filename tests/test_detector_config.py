@@ -52,6 +52,24 @@ def test_config_from_env_reads_imgsz_and_detector(monkeypatch):
     assert cfg.sahi_slice_overlap == pytest.approx(0.3)
 
 
+def test_config_debug_emit_raw_defaults_off_and_reads_env(monkeypatch):
+    # Production safety: emitting pre-gate detections doubles the payload
+    # of /detect replies, so the flag must default to off and only flip
+    # on when the operator explicitly opts in via env. Verify both the
+    # default and the env override paths so a future refactor can't
+    # silently change either.
+    cfg = Config()
+    assert cfg.debug_emit_raw_detections is False
+
+    monkeypatch.setenv("HUMAN_DETECTION_DEBUG_RAW", "true")
+    on = Config.from_env()
+    assert on.debug_emit_raw_detections is True
+
+    monkeypatch.setenv("HUMAN_DETECTION_DEBUG_RAW", "0")
+    off = Config.from_env()
+    assert off.debug_emit_raw_detections is False
+
+
 # --- WaldoDetector forwards imgsz to model.predict ----------------------
 
 
@@ -119,6 +137,37 @@ def test_waldo_detector_clamps_invalid_imgsz_to_floor(empty_detections):
     det, fake = _waldo_with_fake_model(Config(inference_imgsz=0))
     det.detect(np.zeros((240, 320, 3), dtype=np.uint8))
     assert fake.predict_calls[0]["imgsz"] == 32
+
+
+def test_waldo_detector_passes_frame_at_native_aspect(empty_detections):
+    """Regression guard for the WALDO author's #1 failure mode.
+
+    Stephan was clear that "naively squishing the rectangular video to a
+    square" wrecks recall because the network never trained on distorted
+    aspect ratios. Our contract is: hand ultralytics the raw decoded
+    BGR frame and let its internal LetterBox preprocess preserve the
+    aspect ratio to imgsz with grey padding. If a future refactor
+    introduces a `cv2.resize(frame, (imgsz, imgsz))` between us and
+    ultralytics — e.g. a well-meaning "make sure inputs are square"
+    change — recall on the 320x240 production feed will collapse and
+    nobody will notice for weeks. This test fails immediately if that
+    happens.
+    """
+    det, fake = _waldo_with_fake_model(Config(inference_imgsz=640))
+    src = np.zeros((240, 320, 3), dtype=np.uint8)
+    det.detect(src)
+
+    forwarded = fake.predict_calls[0]["source"]
+    # Same array identity (or at minimum same shape/dtype) — proves we
+    # didn't sneak a resize in between.
+    assert isinstance(forwarded, np.ndarray)
+    assert forwarded.shape == src.shape, (
+        "WaldoDetector altered the source frame before ultralytics "
+        "saw it. Stephan flagged squishing 320x240 to a square as the "
+        "WALDO model's #1 failure mode — keep the frame's native aspect "
+        "ratio and let ultralytics' LetterBox handle the resize."
+    )
+    assert forwarded.dtype == src.dtype
 
 
 # --- Detector factory --------------------------------------------------

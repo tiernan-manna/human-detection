@@ -45,7 +45,7 @@ Everything can be set by env var or CLI flag. CLI flags win.
 |---|---|---|---|
 | Bind host | `HUMAN_DETECTION_HOST` | `--host` | `127.0.0.1` |
 | Bind port | `HUMAN_DETECTION_PORT` | `--port` | `8765` |
-| Model | `HUMAN_DETECTION_MODEL` | `--model` | `WALDO30_yolov8l_640x640.pt` |
+| Model | `HUMAN_DETECTION_MODEL` | `--model` | `WALDO30_yolov8l-p2_640x640.pt` |
 | Normal-light conf | `HUMAN_DETECTION_CONF` | `--conf` | `0.20` |
 | Low-light conf | `HUMAN_DETECTION_LOW_LIGHT_CONF` | `--low-light-conf` | `0.12` |
 | Min box fraction | `HUMAN_DETECTION_MIN_BOX_FRACTION` | (n/a) | `0.02` |
@@ -148,7 +148,7 @@ when there are fewer than 25 detections; hidden above that to avoid clutter.
 | Flag | Default | Description |
 |---|---|---|
 | `--conf` | `0.20` | Confidence threshold |
-| `--model` | `WALDO30_yolov8l_640x640.pt` | Override model filename |
+| `--model` | `WALDO30_yolov8l-p2_640x640.pt` | Override model filename |
 | `--sliced` | off | Use SAHI sliced (tiled) inference |
 | `--slice-size` | `320` | Tile size in pixels for sliced inference |
 | `--slice-overlap` | `0.2` | Fractional tile overlap |
@@ -171,19 +171,41 @@ runs when off").
 
 ## Model choice
 
-Benchmarked 5 WALDO variants across 12 overhead test images. Results:
+Default: **`WALDO30_yolov8l-p2_640x640.pt`** (~90 MB).
+
+The `-p2` suffix denotes the small-object detection-head variant of
+WALDO30. Vanilla yolov8l has detection heads at strides 8 / 16 / 32;
+the `-p2` build adds a stride-4 head, which is materially better at
+the 12-30 px-tall people we typically see at delivery altitudes on the
+production 320×240 stream. The WALDO author (Stephan Sturges) was
+unambiguous on this when we asked: **"you definitely need to use the
+-p2 model variants, those are way better at small objects like people"**.
+
+Internal benchmark history across 12 overhead test images is preserved
+below for context — note these numbers are on standard-resolution test
+imagery, *not* the 320×240 delivery feed where the choice of -p2 vs
+plain has the largest practical impact:
 
 | Model | Total dets (std) | Hard-image dets | Notes |
 |---|---|---|---|
 | `yolov8n` | 607 | 2/8 | Fastest, weakest on sparse scenes |
-| `yolov8m` | 1,185 | 4/8 | Previous default |
-| `yolov8m-p2` | 1,061 | 1/8 | Worse than plain medium on this set |
-| **`yolov8l`** | **1,210** | **7/8** | **Current default — best accuracy** |
-| `yolov8l-p2` | 1,184 | 7/8 | Tied with large, slower |
+| `yolov8m` | 1,185 | 4/8 | Older default |
+| `yolov8m-p2` | 1,061 | 1/8 | Underperforms on standard-res imagery |
+| `yolov8l` | 1,210 | 7/8 | Previous default before the 320×240 production feed |
+| **`yolov8l-p2`** | **1,184** | **7/8** | **Current default — small-object head wins on the 320×240 feed** |
 
-Default: **`WALDO30_yolov8l_640x640.pt`** (~87 MB).
+Override via `--model` or `HUMAN_DETECTION_MODEL`. Other variants on
+[StephanST/WALDO30](https://huggingface.co/StephanST/WALDO30) worth
+knowing about:
 
-Override via `--model` or `HUMAN_DETECTION_MODEL` env var.
+- `WALDO30_yolov8l-p2_1024x1024.pt` — same head, trained natively at
+  1024×1024. Pair with `HUMAN_DETECTION_IMGSZ=1024` for the best
+  achievable recall on small targets, at ~2.5× the inference cost.
+  Switch to this once the pilot hardware has the headroom (or when
+  running offline benchmarks).
+- `WALDO30_yolov8m-p2_640x640.pt` / `WALDO30_yolov8n-p2_640x640.pt` —
+  smaller backbones if `l-p2` is too slow on a particular pilot PC.
+  Trade some accuracy for ~2× / ~4× throughput respectively.
 
 ## Inference modes
 

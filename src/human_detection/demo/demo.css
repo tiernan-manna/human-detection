@@ -131,6 +131,15 @@ h1 {
   color: var(--err);
 }
 
+/* Lit when the sidecar is in HUMAN_DETECTION_DEBUG_RAW=true mode so the
+   operator can see at a glance that the dashed-yellow boxes on each tile
+   are the (extra) pre-gate detector output, not a UI bug. */
+.stat-value.debug-raw-on {
+  color: #ffd700;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
 .replay-summary {
   display: flex;
   align-items: center;

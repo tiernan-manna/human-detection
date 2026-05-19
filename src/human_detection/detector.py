@@ -135,6 +135,17 @@ class WaldoDetector:
         assert self._model is not None
         assert self._target_class_ids is not None
 
+        # IMPORTANT: pass the BGR frame straight through to ultralytics.
+        # Resist the urge to do our own resize/normalise — ultralytics'
+        # internal LetterBox preprocessing preserves aspect ratio with
+        # grey padding to the configured `imgsz`, which is what WALDO
+        # was trained on. The WALDO author flagged this explicitly: a
+        # naive squish of a 320x240 frame to a 640x640 square (i.e.
+        # cv2.resize without aspect preservation) wrecks recall because
+        # the model never saw distorted aspect ratios during training.
+        # If you ever need to add per-deployment cropping (e.g. mask out
+        # a baked-in HUD reticle), do it before this call but always
+        # preserve the natural aspect ratio of the source frame.
         results = self._model.predict(
             source=frame,
             conf=self._config.confidence_threshold,

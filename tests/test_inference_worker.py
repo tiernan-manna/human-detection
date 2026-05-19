@@ -450,6 +450,137 @@ async def test_hover_motion_gate_drops_stationary_boost_promoted():
 
 
 @pytest.mark.asyncio
+async def test_gate_counts_track_funnel_through_pipeline():
+    # Three frames of the same person at the same spot:
+    #   Frame 1 — high conf seeds the track. Should pass every gate so
+    #             every after_* slot equals raw=1.
+    #   Frame 2 — same spot, low conf. Track-length gate is set to 3,
+    #             so the detection is swallowed by the LAST gate; the
+    #             post-tracker / post-motion counts must still be 1
+    #             (the detection survived those gates) and only
+    #             after_length drops to 0. This is the exact funnel an
+    #             operator would use to diagnose "boxes vanishing right
+    #             at the end of the pipeline".
+    scripted = _ScriptedDetector([
+        [([100, 100, 200, 200], 0.80)],
+        [([102, 102, 202, 202], 0.15)],
+    ])
+    config = Config(
+        enabled=True,
+        confidence_threshold=0.20,
+        tracking_enabled=True,
+        candidate_conf_threshold=0.10,
+        min_track_length=3,
+        # Hover gates off so this test isolates the funnel under test.
+        hover_boost_enabled=False,
+        hover_motion_gate_enabled=False,
+    )
+    worker = InferenceWorker(config, detector=scripted)
+    replies: list = []
+
+    await worker.start()
+    try:
+        await worker.submit(_job("uav-fc", ts=1, is_low_light=False, replies=replies))
+        await _drain(worker, replies, n=1)
+        await worker.submit(_job("uav-fc", ts=2, is_low_light=False, replies=replies))
+        await _drain(worker, replies, n=2)
+    finally:
+        await worker.stop()
+
+    f1, f2 = replies
+    assert f1.gate_counts.raw == 1
+    assert f1.gate_counts.after_track == 1
+    assert f1.gate_counts.after_motion == 1
+    assert f1.gate_counts.after_length == 1, "high-conf bypasses length gate"
+
+    assert f2.gate_counts.raw == 1, "detector still produced one candidate"
+    assert f2.gate_counts.after_track == 1, "tracker associates the candidate"
+    assert f2.gate_counts.after_motion == 1, "motion gate is disabled"
+    assert f2.gate_counts.after_length == 0, (
+        "length gate must drop the low-conf single-frame promotion"
+    )
+
+
+@pytest.mark.asyncio
+async def test_raw_detections_empty_by_default_and_populated_under_debug_flag():
+    # With the debug flag off (production default), raw_detections is empty
+    # and to_dict() omits the key entirely so the wire format is unchanged
+    # for manna-dash. With the flag on, every reply carries the pre-gate
+    # detector output so the demo overlay can draw the funnel.
+    scripted = _ScriptedDetector([
+        # Frame's only candidate sits below the normal threshold so the
+        # track-length gate would normally kill it on a single appearance —
+        # this gives us a clean "raw produced one box, gates dropped it"
+        # case that the debug array is meant to expose.
+        [([100, 100, 200, 200], 0.15)],
+        [([100, 100, 200, 200], 0.15)],
+    ])
+    debug_config = Config(
+        enabled=True,
+        confidence_threshold=0.20,
+        tracking_enabled=True,
+        candidate_conf_threshold=0.10,
+        min_track_length=3,
+        hover_boost_enabled=False,
+        hover_motion_gate_enabled=False,
+        debug_emit_raw_detections=True,
+    )
+    debug_worker = InferenceWorker(debug_config, detector=scripted)
+    replies_dbg: list = []
+    await debug_worker.start()
+    try:
+        await debug_worker.submit(
+            _job("uav-dbg", ts=1, is_low_light=False, replies=replies_dbg)
+        )
+        await _drain(debug_worker, replies_dbg, n=1)
+    finally:
+        await debug_worker.stop()
+
+    debug_reply = replies_dbg[0]
+    assert len(debug_reply.detections) == 0, (
+        "low-conf single-frame: track-length gate suppresses confirmed output"
+    )
+    assert len(debug_reply.raw_detections) == 1, (
+        "debug flag must surface the dropped candidate as raw"
+    )
+    assert debug_reply.raw_detections[0].conf == pytest.approx(0.15, abs=1e-3)
+    payload = debug_reply.to_dict()
+    assert payload["detections"] == []
+    assert "rawDetections" in payload
+    assert payload["rawDetections"][0]["conf"] == pytest.approx(0.15, abs=1e-3)
+
+    # Same scenario with the flag off: raw must stay empty and the wire
+    # payload must NOT carry the rawDetections key (production parity).
+    prod_scripted = _ScriptedDetector([
+        [([100, 100, 200, 200], 0.15)],
+    ])
+    prod_config = Config(
+        enabled=True,
+        confidence_threshold=0.20,
+        tracking_enabled=True,
+        candidate_conf_threshold=0.10,
+        min_track_length=3,
+        hover_boost_enabled=False,
+        hover_motion_gate_enabled=False,
+        debug_emit_raw_detections=False,
+    )
+    prod_worker = InferenceWorker(prod_config, detector=prod_scripted)
+    replies_prod: list = []
+    await prod_worker.start()
+    try:
+        await prod_worker.submit(
+            _job("uav-prod", ts=1, is_low_light=False, replies=replies_prod)
+        )
+        await _drain(prod_worker, replies_prod, n=1)
+    finally:
+        await prod_worker.stop()
+
+    prod_reply = replies_prod[0]
+    assert prod_reply.raw_detections == []
+    assert "rawDetections" not in prod_reply.to_dict()
+
+
+@pytest.mark.asyncio
 async def test_telemetry_is_stashed_and_absent_is_noop():
     stub = _StubDetector(confidences=[0.30])
     config = Config(enabled=True, tracking_enabled=False)
