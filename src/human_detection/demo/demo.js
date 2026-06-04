@@ -5,9 +5,9 @@
   // can confirm at a glance whether their browser is running the new
   // replay-mode code or a stale cached copy. If you don't see this log
   // after refreshing, your browser is serving stale demo.js from cache.
-  const DEMO_BUILD = "replay-firstpass-fit-1";
+  const DEMO_BUILD = "absent-frames-1";
   console.info(
-    `[demo] human-detection demo build=${DEMO_BUILD} — first-pass replay sends + live fit-to-detections`
+    `[demo] human-detection demo build=${DEMO_BUILD} — per-track box extrapolation + always-visible expand button`
   );
 
   const WS_URL =
@@ -116,6 +116,9 @@
     ctlLabels: document.getElementById("ctl-labels"),
     ctlPause: document.getElementById("ctl-pause"),
     ctlReset: document.getElementById("ctl-reset"),
+    ctlLabelMode: document.getElementById("ctl-label-mode"),
+    ctlLabelStyle: document.getElementById("ctl-label-style"),
+    ctlLabelAbsent: document.getElementById("ctl-label-absent"),
     ctlRecord: document.getElementById("ctl-record"),
     recState: document.getElementById("rec-state"),
     recPreview: document.getElementById("rec-preview"),
@@ -175,6 +178,7 @@
       <div class="tile-media">
         <img alt="${image.name}" />
         <canvas></canvas>
+        <button type="button" class="tile-expand-btn" title="Expand this tile to fill the row for a closer look. Click again (or press Esc) to collapse back into the grid." aria-label="Expand tile"><span class="tile-expand-btn__glyph" aria-hidden="true">&#x2922;</span><span class="tile-expand-btn__label">Expand</span></button>
       </div>
       <div class="tile-footer">
         <span class="tile-name">${image.name}</span>
@@ -185,6 +189,14 @@
         </span>
       </div>
     `;
+
+    const expandBtn = el.querySelector(".tile-expand-btn");
+    if (expandBtn) {
+      expandBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        toggleExpandedTile(el);
+      });
+    }
 
     const img = el.querySelector("img");
     const canvas = el.querySelector("canvas");
@@ -212,6 +224,22 @@
       // confirmed boxes in a contrasting style so an operator can see
       // at a glance which boxes were dropped by the temporal gates.
       rawDetections: [],
+      // Per-track centre-of-box history for client-side velocity
+      // extrapolation between detection updates. Without this the box
+      // freezes at the captured-frame pixel position for the full
+      // inter-update interval (~500 ms at 2 Hz) while the drone yaws or
+      // drifts in the wind — the subject visibly slides out of the
+      // box. With this we slide the box at the per-track measured
+      // velocity until the next update arrives. Map<trackId,
+      // {cx, cy, ts, vx, vy}> where ts is performance.now() at receipt
+      // and vx/vy are EMA-smoothed pixels/ms so per-frame model jitter
+      // on a static subject doesn't whip the box around.
+      trackHistory: new Map(),
+      // performance.now() at the most recent detection message. The
+      // rAF loop uses this to decide when to stop extrapolating (after
+      // BOX_MAX_EXTRAPOLATION_MS the velocity gets too stale to trust
+      // and we'd rather hold position than drift indefinitely).
+      lastDetectionsAt: 0,
     };
 
     return new Promise((resolve) => {
@@ -243,7 +271,616 @@
     });
   }
 
-  function drawBoxes(tile) {
+  // --- Tile expand/collapse ------------------------------------------
+  // Single-tile expansion: only one tile can be expanded at a time.
+  // Clicking the expand button on another tile collapses the first
+  // before promoting the new one. Esc collapses any active expansion.
+  // Tracked as a module-level handle (not on STATE) so the keyboard
+  // listener can find the current target without scanning the DOM.
+  let _expandedTileEl = null;
+
+  function _setExpandBtnLabel(tileEl, expanded) {
+    const btn = tileEl ? tileEl.querySelector(".tile-expand-btn") : null;
+    if (!btn) return;
+    const label = btn.querySelector(".tile-expand-btn__label");
+    if (label) {
+      label.textContent = expanded ? "Collapse" : "Expand";
+    }
+    btn.setAttribute(
+      "aria-label",
+      expanded ? "Collapse tile" : "Expand tile",
+    );
+  }
+
+  function toggleExpandedTile(tileEl) {
+    if (!tileEl) return;
+    if (_expandedTileEl === tileEl) {
+      tileEl.classList.remove("tile--expanded");
+      _setExpandBtnLabel(tileEl, false);
+      _expandedTileEl = null;
+      return;
+    }
+    if (_expandedTileEl) {
+      _expandedTileEl.classList.remove("tile--expanded");
+      _setExpandBtnLabel(_expandedTileEl, false);
+    }
+    tileEl.classList.add("tile--expanded");
+    _setExpandBtnLabel(tileEl, true);
+    _expandedTileEl = tileEl;
+    // Scroll the expanded tile into view — when it lands as a new
+    // full-width row below the operator's current scroll position
+    // they'd otherwise have to hunt for it.
+    tileEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    if (!_expandedTileEl) return;
+    _expandedTileEl.classList.remove("tile--expanded");
+    _setExpandBtnLabel(_expandedTileEl, false);
+    _expandedTileEl = null;
+  });
+
+  // --- Ground-truth labelling ----------------------------------------
+  // Lets the operator scrub through a recording and mark frames where
+  // a human is actually visible (presence mode: click-and-hold) or
+  // draw a tight bbox around them (bbox mode: click-and-drag). The
+  // labels are POSTed to the sidecar so they persist beyond the page
+  // and can be consumed by scripts/analyze_labels.py to recommend a
+  // confidence threshold that maximises F1 on the operator's own
+  // ground truth.
+  //
+  // Single-source-of-truth scoping:
+  // - Labels are only emitted on REPLAY tiles. Still-image tiles have
+  //   no recording/seq concept and the analyser wouldn't know what to
+  //   do with a label keyed to a sample image's filename. The overlay
+  //   never enables on still tiles.
+  // - The label is attached to whatever seq the tile is showing AT
+  //   THE MOMENT THE LABEL FIRES (pointerdown for bbox, pointerdown
+  //   AND every subsequent frame-advance for presence). That's the
+  //   only one the user can actually see.
+  const LABEL_STATE = {
+    enabled: false,
+    // Default style is `presence`. The bbox-drag workflow only
+    // captures ONE rectangle per click-and-release — operators
+    // expecting "hold the mouse the whole time the human is visible
+    // and every frame gets marked" had labels.jsonl receive a
+    // single bbox at session-end and (rightly) thought labelling
+    // wasn't working. Presence is the workflow the user actually
+    // described: click-and-hold marks every frame underneath as
+    // "human present" via onReplayTileFrameAdvanced. Bbox is still
+    // available via the dropdown for users who want to draw
+    // explicit rectangles.
+    style: "presence", // "bbox" | "presence"
+    // Tracks an in-flight bbox draw per overlay: {startX, startY,
+    // rectEl, tileEl, tileObj}. Stored as a Map keyed by the
+    // PointerEvent.pointerId so a stylus + mouse interleaving doesn't
+    // get confused. In practice only one pointer is active at a time.
+    activeDraws: new Map(),
+    // Tiles currently in "presence hold" mode (pointer down, no
+    // bbox). Keyed by tile object. Value is {pointerId} so pointerup
+    // on the matching pointer ends the hold. Multiple tiles can be
+    // mid-hold simultaneously if the user crosses the gutter, but in
+    // practice each tile owns its own pointer capture.
+    presenceHolds: new Map(),
+    // When true, frames where the user is NOT holding the mouse get
+    // an automatic { present: false } label as the playhead advances.
+    // Off by default — turning it on without intent would flood the
+    // labels file with spurious absent rows. Operators flip it on
+    // when they're doing a "negative pass" over a recording (clutter
+    // scenes where they need to teach the model what NOT to detect)
+    // and leave it off during the standard positive-only pass.
+    captureAbsent: false,
+    // Local cache so the UI can show "you've already labelled this
+    // recording N frames" without round-tripping the server every
+    // tile re-render. Map<recordingName, Map<seq, label>>.
+    labelsByRecording: new Map(),
+  };
+
+  function _ensureLabelOverlay(tile) {
+    if (tile.kind !== "replay") return null;
+    let overlay = tile._labelOverlay;
+    if (overlay) return overlay;
+    const media = tile.el.querySelector(".tile-media");
+    if (!media) return null;
+    overlay = document.createElement("div");
+    overlay.className = "tile-label-overlay";
+    const badge = document.createElement("span");
+    badge.className = "tile-label-badge";
+    badge.textContent = "LABEL";
+    badge.hidden = true;
+    overlay.appendChild(badge);
+    // Live counter badge: ticks up by 1 on every successful POST
+    // to /labels/{name}. Sits in the top-right corner so the
+    // operator can see at a glance that labels really are being
+    // saved while they hold the mouse — addresses the "did you get
+    // label data?" feedback gap. Persists across mode toggles
+    // because it's anchored on the tile object, not LABEL_STATE.
+    const counter = document.createElement("span");
+    counter.className = "tile-label-counter";
+    counter.hidden = true;
+    counter.textContent = "0";
+    counter.title =
+      "Number of labels saved for this recording in the current session.";
+    overlay.appendChild(counter);
+    media.appendChild(overlay);
+    tile._labelOverlay = overlay;
+    tile._labelBadge = badge;
+    tile._labelCounter = counter;
+    tile._labelSavedCount = 0;
+    _wireLabelOverlay(tile, overlay);
+    _applyLabelModeToTile(tile);
+    return overlay;
+  }
+
+  function _applyLabelModeToTile(tile) {
+    const overlay = tile._labelOverlay;
+    if (!overlay) return;
+    if (LABEL_STATE.enabled) {
+      overlay.classList.add("is-labelling");
+      if (tile._labelBadge) tile._labelBadge.hidden = false;
+      if (tile._labelCounter) tile._labelCounter.hidden = false;
+    } else {
+      overlay.classList.remove("is-labelling");
+      if (tile._labelBadge) tile._labelBadge.hidden = true;
+      if (tile._labelCounter) tile._labelCounter.hidden = true;
+    }
+  }
+
+  // Brief CSS-class flash on the tile media to confirm a label was
+  // saved. Distinct from the per-tile counter because the counter
+  // tells you "how many" and the flash tells you "the most recent
+  // POST landed". Both together make a labelling session feel
+  // responsive — operators were rightly losing trust in the system
+  // when they couldn't tell if their work was persisting.
+  function _flashLabelSave(tile) {
+    if (!tile || !tile.el) return;
+    const media = tile.el.querySelector(".tile-media");
+    if (!media) return;
+    media.classList.remove("label-saved-flash");
+    // Force a reflow so re-adding the class restarts the CSS
+    // animation, otherwise consecutive saves on the same tile only
+    // animate the first time.
+    void media.offsetWidth;
+    media.classList.add("label-saved-flash");
+    if (tile._flashTimeout) clearTimeout(tile._flashTimeout);
+    tile._flashTimeout = setTimeout(() => {
+      media.classList.remove("label-saved-flash");
+    }, 400);
+  }
+
+  function _wireLabelOverlay(tile, overlay) {
+    // Convert a PointerEvent's clientX/Y into the image's natural-
+    // pixel coordinate system (the same space detections live in).
+    // Returns null when the tile's canvas hasn't been sized yet
+    // (very early frames) so the caller can decline to attach
+    // coordinates rather than store something nonsensical.
+    function _pointerToImagePixels(ev) {
+      const canvas = tile.canvas;
+      if (!canvas || !canvas.width || !canvas.height) return null;
+      const rect = overlay.getBoundingClientRect();
+      if (!rect.width || !rect.height) return null;
+      const cssX = ev.clientX - rect.left;
+      const cssY = ev.clientY - rect.top;
+      // Clamp so a pointermove that drifted onto the gutter doesn't
+      // emit a label outside the image. Operators sometimes overshoot
+      // by a pixel near the tile edge; clamping keeps the labels
+      // valid without dropping the frame.
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      const x = Math.max(0, Math.min(canvas.width - 1, Math.round(cssX * scaleX)));
+      const y = Math.max(0, Math.min(canvas.height - 1, Math.round(cssY * scaleY)));
+      return { x, y };
+    }
+
+    overlay.addEventListener("pointerdown", (ev) => {
+      if (!LABEL_STATE.enabled) return;
+      if (tile.kind !== "replay") return;
+      if (ev.button !== 0) return;
+      ev.preventDefault();
+      try {
+        overlay.setPointerCapture(ev.pointerId);
+      } catch (_) {
+        // setPointerCapture occasionally throws on synthetic events
+        // (some browser test stacks) — fine to swallow.
+      }
+      if (LABEL_STATE.style === "presence") {
+        // Track the latest cursor position on the hold record so
+        // both the initial-frame label below AND the
+        // frame-advance hook in onReplayTileFrameAdvanced can
+        // attach point coords. Stored as {x, y} in IMAGE-natural
+        // pixel coords so the server-side label is in the same
+        // coord system as detections — the dataset-prep script
+        // (build_pseudo_bboxes.py) can then expand each point
+        // into a pseudo-bbox without re-projecting.
+        const startPos = _pointerToImagePixels(ev);
+        const hold = { pointerId: ev.pointerId, lastPos: startPos };
+        LABEL_STATE.presenceHolds.set(tile, hold);
+        _showCursorDot(tile, ev);
+        // Immediate label for the frame already on-screen at the
+        // moment the user clicks. Subsequent frame advances will
+        // get labelled via onReplayTileFrameAdvanced.
+        if (tile.currentSeq != null) {
+          const payload = { seq: tile.currentSeq, present: true };
+          if (startPos) {
+            payload.x = startPos.x;
+            payload.y = startPos.y;
+          }
+          _emitLabel(tile, payload);
+        }
+        return;
+      }
+      const rect = overlay.getBoundingClientRect();
+      const startX = ev.clientX - rect.left;
+      const startY = ev.clientY - rect.top;
+      const rectEl = document.createElement("div");
+      rectEl.className = "tile-label-rect";
+      rectEl.style.left = `${startX}px`;
+      rectEl.style.top = `${startY}px`;
+      rectEl.style.width = "0px";
+      rectEl.style.height = "0px";
+      overlay.appendChild(rectEl);
+      LABEL_STATE.activeDraws.set(ev.pointerId, {
+        startX,
+        startY,
+        rectEl,
+        tile,
+      });
+    });
+
+    overlay.addEventListener("pointermove", (ev) => {
+      if (!LABEL_STATE.enabled) return;
+      // Presence-mode: keep the per-hold lastPos fresh so the next
+      // frame-advance attaches the cursor's CURRENT position to
+      // the label, not the position at click-time. Visualise it
+      // too so the operator can see exactly which pixel is being
+      // recorded as their "where to look" hint.
+      const hold = LABEL_STATE.presenceHolds.get(tile);
+      if (hold && hold.pointerId === ev.pointerId) {
+        const pos = _pointerToImagePixels(ev);
+        if (pos) {
+          hold.lastPos = pos;
+          _moveCursorDot(tile, ev);
+        }
+        return;
+      }
+      const draw = LABEL_STATE.activeDraws.get(ev.pointerId);
+      if (!draw) return;
+      const rect = overlay.getBoundingClientRect();
+      const curX = ev.clientX - rect.left;
+      const curY = ev.clientY - rect.top;
+      const x = Math.min(draw.startX, curX);
+      const y = Math.min(draw.startY, curY);
+      const w = Math.abs(curX - draw.startX);
+      const h = Math.abs(curY - draw.startY);
+      draw.rectEl.style.left = `${x}px`;
+      draw.rectEl.style.top = `${y}px`;
+      draw.rectEl.style.width = `${w}px`;
+      draw.rectEl.style.height = `${h}px`;
+    });
+
+    function _endDraw(ev) {
+      if (!LABEL_STATE.enabled) return;
+      const draw = LABEL_STATE.activeDraws.get(ev.pointerId);
+      if (draw) {
+        LABEL_STATE.activeDraws.delete(ev.pointerId);
+        const rect = overlay.getBoundingClientRect();
+        const endX = ev.clientX - rect.left;
+        const endY = ev.clientY - rect.top;
+        const x1Css = Math.min(draw.startX, endX);
+        const y1Css = Math.min(draw.startY, endY);
+        const x2Css = Math.max(draw.startX, endX);
+        const y2Css = Math.max(draw.startY, endY);
+        const w = x2Css - x1Css;
+        const h = y2Css - y1Css;
+        const tile = draw.tile;
+        const canvas = tile.canvas;
+        if (
+          w >= 6 &&
+          h >= 6 &&
+          tile.currentSeq != null &&
+          canvas &&
+          canvas.width &&
+          canvas.height
+        ) {
+          // Convert CSS overlay coords to image-natural-pixel coords
+          // so the sidecar's stored labels are in the same coordinate
+          // system as detections (img_w × img_h pixels).
+          const scaleX = canvas.width / rect.width;
+          const scaleY = canvas.height / rect.height;
+          _emitLabel(tile, {
+            seq: tile.currentSeq,
+            present: true,
+            x1: Math.round(x1Css * scaleX),
+            y1: Math.round(y1Css * scaleY),
+            x2: Math.round(x2Css * scaleX),
+            y2: Math.round(y2Css * scaleY),
+          });
+        }
+        // Fade the drawn rect out after a short moment so the operator
+        // gets a confirmation flash without leaving stale rectangles
+        // pinned to the overlay forever.
+        setTimeout(() => {
+          if (draw.rectEl && draw.rectEl.parentNode) {
+            draw.rectEl.parentNode.removeChild(draw.rectEl);
+          }
+        }, 600);
+      }
+      // The pointerup may have come from a presence hold (no draw
+      // record). Walk the holds and clear any that match this
+      // pointerId; covers both the "bbox release with a stray hold"
+      // and the "presence hold release" cases in one branch.
+      for (const [tile, h] of LABEL_STATE.presenceHolds) {
+        if (h.pointerId === ev.pointerId) {
+          LABEL_STATE.presenceHolds.delete(tile);
+          _hideCursorDot(tile);
+        }
+      }
+      try {
+        overlay.releasePointerCapture(ev.pointerId);
+      } catch (_) {
+        // ignore
+      }
+    }
+    overlay.addEventListener("pointerup", _endDraw);
+    overlay.addEventListener("pointercancel", _endDraw);
+    overlay.addEventListener("pointerleave", (ev) => {
+      // Treat leaving the tile mid-hold as ending the hold so the
+      // operator doesn't accidentally keep labelling frames after the
+      // mouse has left the tile area.
+      _endDraw(ev);
+    });
+  }
+
+  // Called from sendReplayTile when the playhead advances to a new
+  // recorded seq. If the user is currently mid-hold in presence mode,
+  // we attribute a "present" label to the newly-revealed frame too —
+  // this is the workflow the user described: "click and hold the
+  // mouse whenever a human is visible". When a cursor position has
+  // been captured this hold, we attach it to the label as point
+  // supervision: the hold's lastPos is the image-pixel coord the
+  // operator was hovering on at the moment the playhead advanced,
+  // so each frame in the labelled span gets a "person was roughly
+  // HERE" hint that scripts/build_pseudo_bboxes.py expands into a
+  // training-time pseudo-bbox.
+  function onReplayTileFrameAdvanced(tile, seq) {
+    if (!LABEL_STATE.enabled) return;
+    if (LABEL_STATE.style !== "presence") return;
+    if (seq == null) return;
+    const hold = LABEL_STATE.presenceHolds.get(tile);
+    if (hold) {
+      const payload = { seq, present: true };
+      if (hold.lastPos) {
+        payload.x = hold.lastPos.x;
+        payload.y = hold.lastPos.y;
+      }
+      _emitLabel(tile, payload);
+      return;
+    }
+    // No hold this frame. If the operator opted in to absent-frame
+    // capture, mark it { present: false } so the next pseudo-bbox
+    // dataset build can include negative samples — without this,
+    // the model only ever trains on "human visible" examples and
+    // can't learn what background-without-subject looks like, which
+    // is the dominant FP source on cluttered scenes.
+    if (LABEL_STATE.captureAbsent) {
+      _emitLabel(tile, { seq, present: false });
+    }
+  }
+
+  // Visible cursor-position dot on the tile during a presence-mode
+  // hold. Reassures the operator that the position they're tracking
+  // is actually being captured into the label payload — without
+  // it they have no way to verify the cursor coords are landing on
+  // their target subject. Hidden as soon as the hold ends.
+  function _showCursorDot(tile, ev) {
+    const overlay = tile._labelOverlay;
+    if (!overlay) return;
+    let dot = tile._labelCursorDot;
+    if (!dot) {
+      dot = document.createElement("span");
+      dot.className = "tile-label-cursor-dot";
+      overlay.appendChild(dot);
+      tile._labelCursorDot = dot;
+    }
+    dot.hidden = false;
+    _moveCursorDot(tile, ev);
+  }
+
+  function _moveCursorDot(tile, ev) {
+    const overlay = tile._labelOverlay;
+    const dot = tile._labelCursorDot;
+    if (!overlay || !dot) return;
+    const rect = overlay.getBoundingClientRect();
+    const cssX = ev.clientX - rect.left;
+    const cssY = ev.clientY - rect.top;
+    dot.style.left = `${cssX}px`;
+    dot.style.top = `${cssY}px`;
+  }
+
+  function _hideCursorDot(tile) {
+    if (tile && tile._labelCursorDot) {
+      tile._labelCursorDot.hidden = true;
+    }
+  }
+
+  function _emitLabel(tile, label) {
+    if (!tile || !tile.recordingName) return;
+    let m = LABEL_STATE.labelsByRecording.get(tile.recordingName);
+    if (!m) {
+      m = new Map();
+      LABEL_STATE.labelsByRecording.set(tile.recordingName, m);
+    }
+    // Skip the network round-trip when the same seq is being
+    // labelled with the exact same payload (e.g. presence-mode
+    // re-fires for the seq the user clicked on, before the
+    // playhead has advanced). Without this guard, holding the
+    // mouse on a paused tile would spam identical POSTs.
+    const prior = m.get(label.seq);
+    if (
+      prior &&
+      prior.present === label.present &&
+      prior.x1 === label.x1 &&
+      prior.y1 === label.y1 &&
+      prior.x2 === label.x2 &&
+      prior.y2 === label.y2 &&
+      prior.x === label.x &&
+      prior.y === label.y
+    ) {
+      return;
+    }
+    m.set(label.seq, label);
+    // Fire-and-forget POST. The sidecar appends to labels.jsonl;
+    // duplicates per (seq) are de-duplicated server-side by taking
+    // the most recent one. We don't await — if the network blip
+    // drops a label the user can re-click; the local cache is the
+    // source of truth for the in-flight session.
+    fetch(`/labels/${encodeURIComponent(tile.recordingName)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(label),
+      keepalive: true,
+    })
+      .then((resp) => {
+        if (!resp.ok) {
+          // Server rejected the label. Most common cause is a
+          // partial bbox or missing `present` field — a regression
+          // somewhere in this file. Log loudly, the operator's
+          // counter would otherwise keep ticking on labels that
+          // never landed.
+          console.warn(
+            "label POST rejected",
+            resp.status,
+            tile.recordingName,
+            label,
+          );
+          return;
+        }
+        // On success, tick the per-tile counter and flash. Counter
+        // is per-tile so an operator running multiple recordings
+        // in parallel sees each tile's own progress.
+        if (tile._labelCounter) {
+          tile._labelSavedCount = (tile._labelSavedCount || 0) + 1;
+          tile._labelCounter.textContent = String(tile._labelSavedCount);
+        }
+        _flashLabelSave(tile);
+      })
+      .catch(() => {
+        // Logging every network blip would spam the console during
+        // a long labelling session; the cache holds the user's
+        // work and a re-hold will resend.
+      });
+  }
+
+  function setLabelMode(enabled) {
+    LABEL_STATE.enabled = !!enabled;
+    document.body.classList.toggle(
+      "is-label-mode-off",
+      !LABEL_STATE.enabled,
+    );
+    for (const tile of STATE.tiles) {
+      if (tile.kind !== "replay") continue;
+      _ensureLabelOverlay(tile);
+      _applyLabelModeToTile(tile);
+    }
+  }
+
+  function setLabelStyle(style) {
+    LABEL_STATE.style = style === "presence" ? "presence" : "bbox";
+  }
+
+  // --- Client-side box extrapolation ----------------------------------
+  // Detections arrive at 1-2 Hz but the underlying JPEG advances much
+  // faster. Between updates we slide each tracked box along the velocity
+  // measured from the last two updates so the rectangle visibly follows
+  // the subject through the inter-update gap instead of freezing on
+  // stale pixels and then teleporting to the new position.
+  //
+  // BOX_MAX_EXTRAPOLATION_MS bounds the extrapolation so a track that
+  // suddenly goes silent doesn't fly off-screen along a stale velocity
+  // vector. 350 ms (down from 750) mirrors the server-side persistence
+  // clamp (max_misses=1 ≈ one frame at 2 Hz hover sampling). Without
+  // this the client kept sliding the box for an extra ~400 ms past
+  // the last server update — exactly the "box stays put on stale
+  // pixels while the subject has moved on" symptom operators
+  // complained about. Beyond the cap the box holds its last-known
+  // position until a fresh update lands (or vanishes via sidecar
+  // persistence cleanup).
+  //
+  // BOX_VELOCITY_DEADZONE_PX_PER_SEC suppresses the per-frame coordinate
+  // jitter the YOLO model produces on a perfectly static subject. Below
+  // this speed we treat the track as "not really moving" and skip the
+  // extrapolation step, otherwise the box would dither across a few
+  // pixels every animation frame in lockstep with the model's natural
+  // bounding-box noise on a stationary person.
+  const BOX_MAX_EXTRAPOLATION_MS = 350;
+  const BOX_VELOCITY_DEADZONE_PX_PER_SEC = 8;
+  const BOX_VELOCITY_EMA_ALPHA = 0.5;
+
+  function updateTrackHistory(tile, detections, now) {
+    if (!tile.trackHistory) tile.trackHistory = new Map();
+    for (const det of detections) {
+      if (det.trackId == null) continue;
+      const cx = (det.x1 + det.x2) / 2;
+      const cy = (det.y1 + det.y2) / 2;
+      const hist = tile.trackHistory.get(det.trackId);
+      if (!hist) {
+        tile.trackHistory.set(det.trackId, {
+          cx,
+          cy,
+          ts: now,
+          vx: 0,
+          vy: 0,
+        });
+      } else {
+        // Pixels-per-millisecond — keep the unit consistent so the draw
+        // step can just multiply by (now - ts) without converting.
+        const dt = Math.max(1, now - hist.ts);
+        const instVx = (cx - hist.cx) / dt;
+        const instVy = (cy - hist.cy) / dt;
+        hist.vx =
+          BOX_VELOCITY_EMA_ALPHA * instVx +
+          (1 - BOX_VELOCITY_EMA_ALPHA) * hist.vx;
+        hist.vy =
+          BOX_VELOCITY_EMA_ALPHA * instVy +
+          (1 - BOX_VELOCITY_EMA_ALPHA) * hist.vy;
+        hist.cx = cx;
+        hist.cy = cy;
+        hist.ts = now;
+      }
+    }
+    // Prune entries we haven't seen in a long time. The sidecar's
+    // tracker eventually evicts a lost track, but until that happens
+    // we'd keep its history forever — over long replays the map would
+    // grow unbounded.
+    for (const [tid, h] of tile.trackHistory) {
+      if (now - h.ts > 10_000) tile.trackHistory.delete(tid);
+    }
+  }
+
+  function extrapolateBoxXyxy(det, tile, now) {
+    if (det.trackId == null) return null;
+    if (!tile.trackHistory) return null;
+    const hist = tile.trackHistory.get(det.trackId);
+    if (!hist) return null;
+    const dt = Math.min(BOX_MAX_EXTRAPOLATION_MS, Math.max(0, now - hist.ts));
+    if (dt <= 0) return null;
+    // Velocity is in px/ms but the dead-zone is intuitive in px/s.
+    const speedPxPerSec =
+      Math.hypot(hist.vx, hist.vy) * 1000;
+    if (speedPxPerSec < BOX_VELOCITY_DEADZONE_PX_PER_SEC) return null;
+    const dx = hist.vx * dt;
+    const dy = hist.vy * dt;
+    return {
+      x1: det.x1 + dx,
+      y1: det.y1 + dy,
+      x2: det.x2 + dx,
+      y2: det.y2 + dy,
+    };
+  }
+
+  function drawBoxes(tile, now) {
+    if (now == null) now = performance.now();
     const ctx = tile.canvas.getContext("2d");
     ctx.clearRect(0, 0, tile.canvas.width, tile.canvas.height);
     const hasReal = tile.detections.length > 0;
@@ -253,6 +890,19 @@
     const lineW = Math.max(2, Math.round(tile.canvas.width / 300));
     const fontPx = Math.max(12, Math.round(tile.canvas.width / 60));
     ctx.font = `600 ${fontPx}px -apple-system, sans-serif`;
+
+    // Compute the extrapolated render coords for the real detections
+    // ONCE so both the raw-overlap suppression and the actual stroke
+    // see the same positions. Without this the raw-suppression IoU
+    // check would compare raw boxes against the un-extrapolated real
+    // boxes and let through duplicates on top of moving subjects.
+    const realRender = tile.detections.map((d) => {
+      const ext = hasReal ? extrapolateBoxXyxy(d, tile, now) : null;
+      if (!ext) {
+        return { x1: d.x1, y1: d.y1, x2: d.x2, y2: d.y2, src: d };
+      }
+      return { ...ext, src: d };
+    });
 
     // Pre-gate boxes go FIRST so the confirmed (red) boxes overpaint
     // them when the same detection survives the gates. Style choices:
@@ -264,13 +914,12 @@
     //     confirmed one so the screen doesn't get cluttered with
     //     duplicate outlines for the same person.
     if (hasRaw) {
-      const realBoxes = tile.detections;
       ctx.save();
       ctx.lineWidth = Math.max(1, Math.round(lineW * 0.6));
       ctx.setLineDash([Math.max(4, lineW * 2), Math.max(3, lineW)]);
       ctx.strokeStyle = "rgba(255, 215, 0, 0.85)";
       for (const d of tile.rawDetections) {
-        if (boxOverlapsAny(d, realBoxes, 0.4)) continue;
+        if (boxOverlapsAny(d, realRender, 0.4)) continue;
         const w = d.x2 - d.x1;
         const h = d.y2 - d.y1;
         ctx.strokeRect(d.x1, d.y1, w, h);
@@ -300,10 +949,11 @@
     ctx.strokeStyle = "rgba(255, 59, 59, 0.95)";
     ctx.fillStyle = "rgba(255, 59, 59, 0.95)";
 
-    for (const d of tile.detections) {
-      const w = d.x2 - d.x1;
-      const h = d.y2 - d.y1;
-      ctx.strokeRect(d.x1, d.y1, w, h);
+    for (const r of realRender) {
+      const d = r.src;
+      const w = r.x2 - r.x1;
+      const h = r.y2 - r.y1;
+      ctx.strokeRect(r.x1, r.y1, w, h);
 
       if (!STATE.showLabels) continue;
 
@@ -312,12 +962,45 @@
       const padY = 3;
       const textW = ctx.measureText(label).width;
       const boxH = fontPx + padY * 2;
-      const boxY = d.y1 - boxH < 0 ? d.y1 : d.y1 - boxH;
+      const boxY = r.y1 - boxH < 0 ? r.y1 : r.y1 - boxH;
       ctx.fillStyle = "rgba(255, 59, 59, 0.95)";
-      ctx.fillRect(d.x1, boxY, textW + padX * 2, boxH);
+      ctx.fillRect(r.x1, boxY, textW + padX * 2, boxH);
       ctx.fillStyle = "#fff";
-      ctx.fillText(label, d.x1 + padX, boxY + fontPx + padY - 2);
+      ctx.fillText(label, r.x1 + padX, boxY + fontPx + padY - 2);
     }
+  }
+
+  // Single self-rescheduling animation-frame loop that redraws every
+  // tile whose detections are recent enough to still be extrapolated.
+  // We stop scheduling once all tiles' last-detection timestamps are
+  // older than BOX_MAX_EXTRAPOLATION_MS — the boxes either get cleared
+  // by an incoming message or just hold their final position with no
+  // CPU cost until then.
+  let _boxRedrawScheduled = false;
+  function scheduleBoxRedraw() {
+    if (_boxRedrawScheduled) return;
+    _boxRedrawScheduled = true;
+    requestAnimationFrame(_boxRedrawTick);
+  }
+  function _boxRedrawTick() {
+    _boxRedrawScheduled = false;
+    const now = performance.now();
+    let needsAnother = false;
+    for (const tile of STATE.tiles) {
+      if (!tile || !tile.canvas) continue;
+      const hasAny =
+        (tile.detections && tile.detections.length > 0) ||
+        (tile.rawDetections && tile.rawDetections.length > 0);
+      if (!hasAny) continue;
+      drawBoxes(tile, now);
+      if (
+        tile.lastDetectionsAt &&
+        now - tile.lastDetectionsAt < BOX_MAX_EXTRAPOLATION_MS
+      ) {
+        needsAnother = true;
+      }
+    }
+    if (needsAnother) scheduleBoxRedraw();
   }
 
   function boxOverlapsAny(box, candidates, iouThreshold) {
@@ -366,10 +1049,13 @@
       }
       const tile = STATE.tiles.find((t) => t.uavId === msg.uavId);
       if (!tile) return;
+      const recvNow = performance.now();
       tile.recv += 1;
-      tile.lastReplyAt = performance.now();
+      tile.lastReplyAt = recvNow;
       tile.detections = msg.detections || [];
       tile.rawDetections = msg.rawDetections || [];
+      tile.lastDetectionsAt = recvNow;
+      updateTrackHistory(tile, tile.detections, recvNow);
       // For replay tiles, sendReplayTile encodes the recorded seq into the
       // outbound `ts`. The server echoes ts_ms straight back, so the
       // reply tells us exactly which recorded frame these detections
@@ -402,7 +1088,13 @@
       }
       tile.el.classList.add("active");
       tile.el.classList.remove("stale");
-      drawBoxes(tile);
+      drawBoxes(tile, recvNow);
+      // Kick the per-frame redraw so the box slides with the
+      // subject between this update and the next one instead of
+      // freezing on the captured-frame pixel position. The tick
+      // function stops rescheduling itself once the extrapolation
+      // window expires, so a quiet tile drops back to zero cost.
+      scheduleBoxRedraw();
       STATE.recvSinceLastTick += 1;
       STATE.detsSinceLastTick += tile.detections.length;
     });
@@ -479,6 +1171,7 @@
       <div class="tile-media">
         <img alt="${escapeHtml(uavId)}" />
         <canvas></canvas>
+        <button type="button" class="tile-expand-btn" title="Expand this tile to fill the row for a closer look at the recording. Click again (or press Esc) to collapse back into the grid." aria-label="Expand tile"><span class="tile-expand-btn__glyph" aria-hidden="true">&#x2922;</span><span class="tile-expand-btn__label">Expand</span></button>
       </div>
       <div class="tile-footer">
         <span class="tile-name">${escapeHtml(uavId)}</span>
@@ -489,6 +1182,16 @@
         </span>
       </div>
     `;
+    const expandBtn = el.querySelector(".tile-expand-btn");
+    if (expandBtn) {
+      // stopPropagation so the expand click doesn't bubble up to the
+      // labelling overlay's pointerdown handler when label mode is on
+      // — pressing expand should never accidentally start a draw.
+      expandBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        toggleExpandedTile(el);
+      });
+    }
     const img = el.querySelector("img");
     const canvas = el.querySelector("canvas");
     const media = el.querySelector(".tile-media");
@@ -523,6 +1226,12 @@
       // to the right per-recording map without re-deriving it from the
       // manifest on every message.
       recordingName: source.recordingName,
+      // Last recorded seq this tile actually advanced its <img> src to.
+      // Tracked so the labelling overlay can attach labels to the
+      // correct frame even when WS replies are batched/delayed and
+      // the seq the user is *looking at* differs from the seq the
+      // most recent detection reply was for.
+      currentSeq: firstFrame ? firstFrame.seq : null,
       playlist,
       cursor: 0,
       lastSentAt: 0,
@@ -584,6 +1293,15 @@
       // cursor, which on a big recording could be seconds.
       if (!tile.img.src.endsWith(frame.jpegUrl)) {
         tile.img.src = frame.jpegUrl;
+        tile.currentSeq = frame.seq;
+        // If the user is mid-hold in presence mode, the playhead just
+        // moved to a new frame underneath them — that's the entire
+        // point of "click and hold while a person is visible". Emit a
+        // label for the freshly-advanced frame from the label module's
+        // event hook (no-op when labelling isn't active).
+        if (typeof onReplayTileFrameAdvanced === "function") {
+          onReplayTileFrameAdvanced(tile, frame.seq);
+        }
         if (
           frame.imgW &&
           frame.imgH &&
@@ -596,9 +1314,15 @@
           if (media) media.style.aspectRatio = `${frame.imgW} / ${frame.imgH}`;
         }
         // Box overlays from the previous frame are stale as soon as we
-        // advance the playhead.
+        // advance the playhead. Also drop the velocity history — the
+        // playhead jump can be back to seq 1 on a replay loop, where
+        // the same trackId may now refer to a person standing somewhere
+        // completely different. Carrying the old velocity forward
+        // would whip the box across the frame on the next update.
         tile.detections = [];
         tile.rawDetections = [];
+        tile.lastDetectionsAt = 0;
+        if (tile.trackHistory) tile.trackHistory.clear();
         drawBoxes(tile);
       }
 
@@ -904,6 +1628,11 @@
     const tiles = await Promise.all(builds);
     STATE.tiles = tiles;
     for (const t of tiles) els.grid.appendChild(t.el);
+    // Re-apply the labelling overlay state — new tiles need it
+    // attached and existing-but-stale overlays need their
+    // is-labelling class re-synced. Cheap no-op when label mode
+    // is off.
+    setLabelMode(LABEL_STATE.enabled);
   }
 
   function buildReplayTiles(count) {
@@ -944,6 +1673,7 @@
     }
     STATE.tiles = tiles;
     for (const t of tiles) els.grid.appendChild(t.el);
+    setLabelMode(LABEL_STATE.enabled);
   }
 
   // Resolve the playlist of frame indices for `source` after applying any
@@ -1505,6 +2235,30 @@
         t.recv = 0;
       }
     });
+    if (els.ctlLabelMode) {
+      // Reflect the default checkbox state onto the body so the
+      // "label style" sub-control is hidden when label mode is off.
+      setLabelMode(els.ctlLabelMode.checked);
+      els.ctlLabelMode.addEventListener("change", (e) => {
+        setLabelMode(!!e.target.checked);
+      });
+    } else {
+      // Even without the checkbox in the DOM, keep body class
+      // consistent so the CSS rules don't get stranded.
+      document.body.classList.add("is-label-mode-off");
+    }
+    if (els.ctlLabelStyle) {
+      setLabelStyle(els.ctlLabelStyle.value);
+      els.ctlLabelStyle.addEventListener("change", (e) => {
+        setLabelStyle(e.target.value);
+      });
+    }
+    if (els.ctlLabelAbsent) {
+      LABEL_STATE.captureAbsent = els.ctlLabelAbsent.checked;
+      els.ctlLabelAbsent.addEventListener("change", (e) => {
+        LABEL_STATE.captureAbsent = e.target.checked;
+      });
+    }
     if (els.ctlWindowStart) {
       els.ctlWindowStart.addEventListener("change", onWindowInputChange);
     }

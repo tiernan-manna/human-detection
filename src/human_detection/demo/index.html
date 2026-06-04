@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>Human Detection Sidecar — Demo</title>
-  <link rel="stylesheet" href="/demo/demo.css?v=replay-firstpass-fit-1" />
+  <link rel="stylesheet" href="/demo/demo.css?v=absent-frames-1" />
 </head>
 <body>
   <header>
@@ -115,6 +115,21 @@
       </label>
       <button id="ctl-pause" type="button" title="Stop sending new frames to the sidecar. Already-pending inferences still come back, but no new work is queued.">pause</button>
       <button id="ctl-reset" type="button" title="Zero out the avg/p95/drops counters. The sidecar itself is untouched.">reset stats</button>
+      <label class="checkbox" title="Turn on click-and-hold labelling on each replay tile. ON: every replay tile gains a yellow LABEL badge in its top-left and a saved-count badge in its top-right ticks up as labels are written. With the default 'presence' style, click and hold anywhere on a tile and every frame underneath the mouse gets marked 'human visible' (release to stop). Labels persist per-recording at recordings/{name}/labels.jsonl on the sidecar; run scripts/analyze_labels.py {recording-name} to sweep confidence thresholds against your labels and get a recommended HUMAN_DETECTION_CONF. OFF (default) so it doesn't interfere with normal viewing.">
+        <input type="checkbox" id="ctl-label-mode" />
+        label mode
+      </label>
+      <label class="ctl-label-submode" title="Pick the labelling style. PRESENCE (default): click and hold anywhere on the tile and every frame underneath the mouse gets marked 'human visible' — matches the 'left-click held the whole time the person is on-screen' workflow. BBOX: drag a rectangle to label one specific frame's bounding box. Presence is the right choice for sweeping through a recording and flagging visibility, bbox is the right choice for precise per-frame labels.">
+        label style
+        <select id="ctl-label-style">
+          <option value="presence" selected>presence</option>
+          <option value="bbox">bbox</option>
+        </select>
+      </label>
+      <label class="checkbox" title="When ON in presence mode: every frame the playhead crosses WITHOUT the mouse held emits an automatic 'human NOT visible' label. Use this on a 'negative pass' over a recording — let it play and only hold the mouse when a human is actually on screen. The model uses these absent frames as background examples so it learns what NOT to detect, which is the single biggest fix for false positives on cluttered scenes. OFF (default) so a normal positive-only labelling pass doesn't accidentally flood the labels file.">
+        <input type="checkbox" id="ctl-label-absent" />
+        capture absent frames
+      </label>
       <span id="replay-status" class="rec-state" hidden
             title="Progress of the replay-mode preload: the demo fetches the recording's JPEGs once into the browser cache so the send loop never blocks on disk I/O. Once it says ready, throughput numbers reflect pure detector + WS overhead."></span>
       <span class="rec-group">
@@ -191,6 +206,6 @@
     </span>
   </footer>
 
-  <script src="/demo/demo.js?v=replay-firstpass-fit-1"></script>
+  <script src="/demo/demo.js?v=absent-frames-1"></script>
 </body>
 </html>

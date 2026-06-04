@@ -65,6 +65,7 @@ import json
 import logging
 import mimetypes
 import struct
+import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -497,6 +498,130 @@ def _register_recording_routes(app: FastAPI, recorder: Recorder) -> None:
         if not existed:
             raise HTTPException(status_code=404, detail="session not found")
         return {"deleted": name}
+
+    @app.post("/labels/{name}")
+    async def append_label(
+        name: str,
+        payload: dict = Body(...),
+    ) -> dict:
+        """Append a single ground-truth label for a recorded session.
+
+        The demo's labelling UI POSTs one of these per click-and-drag
+        (bbox mode) or click-and-hold-while-frame-advances (presence
+        mode). Stored append-only in `recordings/{name}/labels.jsonl`
+        so a long labelling pass survives a server restart, and so
+        scripts/analyze_labels.py can read it back to compute P/R/F1
+        against the recording's live_results.jsonl.
+
+        The dedup-by-seq rule used at read time (latest line wins) is
+        deliberate: re-labelling a frame should be cheap. We append
+        rather than rewrite so a labelling session is never destructive
+        if the user changes their mind.
+        """
+        seq = payload.get("seq")
+        if not isinstance(seq, int) or seq < 0:
+            raise HTTPException(status_code=400, detail="seq must be int >= 0")
+        present = payload.get("present")
+        if not isinstance(present, bool):
+            raise HTTPException(status_code=400, detail="present must be bool")
+        coords: dict[str, int] = {}
+        for key in ("x1", "y1", "x2", "y2"):
+            if key in payload and payload[key] is not None:
+                if not isinstance(payload[key], (int, float)):
+                    raise HTTPException(
+                        status_code=400, detail=f"{key} must be a number"
+                    )
+                coords[key] = int(payload[key])
+        if coords:
+            # If any coord is supplied, ALL four must be present and
+            # form a non-degenerate box. Half-supplied bbox is a UI
+            # bug — better to surface it than silently store garbage.
+            missing = [k for k in ("x1", "y1", "x2", "y2") if k not in coords]
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"bbox requires all of x1,y1,x2,y2 (missing {missing})",
+                )
+            if coords["x2"] <= coords["x1"] or coords["y2"] <= coords["y1"]:
+                raise HTTPException(
+                    status_code=400, detail="bbox must be non-degenerate"
+                )
+
+        # Optional point label (presence-mode mouse position): the
+        # demo's pointermove + frame-advance hooks emit `x` and `y`
+        # in image-natural-pixel coords so the operator's
+        # click-and-track gesture is preserved as a per-frame point
+        # supervision signal. Treated as a STEPPING STONE toward
+        # bbox supervision, not a substitute: scripts/build_pseudo_
+        # bboxes.py expands these into pseudo-bboxes for fine-tuning,
+        # using altitude + frame size to estimate the box footprint
+        # around the cursor. Both fields must arrive together — a
+        # half-supplied point is a UI bug, same as half-supplied
+        # bbox.
+        point: dict[str, int] = {}
+        for key in ("x", "y"):
+            if key in payload and payload[key] is not None:
+                if not isinstance(payload[key], (int, float)):
+                    raise HTTPException(
+                        status_code=400, detail=f"{key} must be a number"
+                    )
+                point[key] = int(payload[key])
+        if point and len(point) != 2:
+            missing = [k for k in ("x", "y") if k not in point]
+            raise HTTPException(
+                status_code=400,
+                detail=f"point requires both x and y (missing {missing})",
+            )
+
+        session_dir = _resolve_session_dir(recorder, name)
+        labels_path = session_dir / "labels.jsonl"
+        # ts is sidecar wall-clock time at receipt — useful for
+        # debugging label-vs-detection latency but not used by the
+        # analyser, which keys by seq.
+        record: dict = {
+            "seq": seq,
+            "ts": int(time.time() * 1000),
+            "present": present,
+        }
+        record.update(coords)
+        record.update(point)
+        # Append-only. fsync is overkill for the labelling use case;
+        # an OS crash during labelling losing the last few lines is
+        # tolerable (the user can re-click) and avoiding the fsync
+        # cost keeps the labelling UI snappy across hundreds of
+        # rapid frame-advance POSTs in presence mode.
+        with labels_path.open("a") as fh:
+            fh.write(json.dumps(record) + "\n")
+        return {"ok": True, "seq": seq}
+
+    @app.get("/labels/{name}")
+    async def get_labels(name: str) -> dict:
+        """Return the labels for a recording, deduped by seq (latest
+        write wins). Used by the demo to seed the labelling UI on
+        tile load so the operator can see which frames they've
+        already labelled, and by scripts/analyze_labels.py to compute
+        precision/recall against the recording's live_results.jsonl.
+        """
+        session_dir = _resolve_session_dir(recorder, name)
+        labels_path = session_dir / "labels.jsonl"
+        labels: dict[int, dict] = {}
+        if labels_path.is_file():
+            with labels_path.open() as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    seq = rec.get("seq")
+                    if isinstance(seq, int):
+                        labels[seq] = rec
+        # Sort by seq so the UI can render a "labels timeline" without
+        # re-sorting on the client.
+        ordered = [labels[seq] for seq in sorted(labels.keys())]
+        return {"name": name, "labels": ordered}
 
 
 def _register_live_routes(app: FastAPI, live: LiveFrameStore) -> None:
