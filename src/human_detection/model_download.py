@@ -16,7 +16,10 @@ from huggingface_hub import hf_hub_download
 
 
 WALDO_REPO = "StephanST/WALDO30"
-MODELS_DIR = Path(__file__).resolve().parents[2].parent / "models"
+# Repo-local models directory. The currently-shipped fine-tune is
+# committed here (see .gitignore exception); auto-downloaded WALDO
+# base checkpoints land here too on first run.
+MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 
 # Fine-tunes we produce locally via scripts/finetune.py. These are not
 # published to HuggingFace; production deploys are expected to bundle

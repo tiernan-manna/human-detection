@@ -12,10 +12,17 @@ venv/
 .venv/
 env/
 
-# Model weights (downloaded on first run, too large for git)
-models/
-*.pt
+# Model weights. The WALDO base checkpoints auto-download on first run,
+# so we don't need them in git. Local fine-tunes produced by
+# scripts/finetune.py also land in models/ and stay machine-local.
+#
+# EXCEPTION: the currently-shipped fine-tune is committed so a fresh
+# pilot install gets the best model out of the box. The negation MUST
+# come after `*.pt` or that pattern will re-exclude it.
+models/*
 *.onnx
+*.pt
+!models/finetune-multi-v3-best.pt
 
 # Inference outputs
 outputs/

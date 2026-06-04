@@ -13,25 +13,38 @@ from dataclasses import dataclass, field
 
 # Default is the most-recent fine-tune of `WALDO30_yolov8m_p2_640x640.pt`
 # on operator footage with point-supervision pseudo-bboxes (see
-# scripts/finetune.py). Runs at the same 640 native resolution + SAHI
-# tiling as the un-fine-tuned base, so latency is identical (~70 ms/frame
-# on M3 MPS) — leaves throughput headroom for multi-stream pilot
-# operation (10 simultaneous streams feasible on modest server-class
-# hardware at this latency).
+# scripts/finetune.py). Runs at 640 native resolution + SAHI tiling so
+# latency is ~70 ms/frame on M3 MPS — leaves throughput headroom for
+# multi-stream pilot operation (10 simultaneous streams feasible on
+# modest server-class hardware at this latency).
 #
-# This is a LOCAL-ONLY artifact: not on HuggingFace, must be present at
-# `models/finetune-multi-v3-best.pt`. Production deploys are expected
-# to bundle it in their artifact. If it's missing on a fresh install,
-# `model_download.ensure_model` falls back to
-# `WALDO30_yolov8l-p2_640x640.pt` with a loud warning so the sidecar
-# still works — see model_download.py.
+# Shipped with the repo at `models/finetune-multi-v3-best.pt` (~48 MB,
+# committed via a .gitignore exception). Pilots cloning the repo get it
+# automatically; no separate artifact distribution required. If for any
+# reason it's missing, `model_download.ensure_model` falls back to
+# `WALDO30_yolov8l-p2_640x640.pt` (auto-downloadable from HuggingFace)
+# with a warning so the sidecar still works.
+#
+# DEPRECATION POLICY: this fine-tune is a stop-gap. The WALDO author
+# (Stephan Sturges) has been engaged about training a 320×240-native
+# variant of WALDO and/or shipping the next-gen RF-DETR builds. When
+# either lands and benchmarks better than v3 on `outputs/bench/`, the
+# steps are:
+#   1. Update DEFAULT_MODEL to the new model name.
+#   2. Delete `models/finetune-multi-v3-best.pt` from the repo (and
+#      remove the `!models/finetune-multi-v3-best.pt` exception from
+#      .gitignore) so it's no longer shipped.
+#   3. If the replacement is HuggingFace-hosted, no further work
+#      required — model_download.ensure_model will fetch on first run.
+#      If it's also a local-only fine-tune, repeat the .gitignore-
+#      exception pattern with the new filename.
 #
 # Higher-recall opt-in (single-stream only):
 #     HUMAN_DETECTION_MODEL=WALDO30_yolov8l-p2_1024x1024.pt
 #     HUMAN_DETECTION_IMGSZ=1024
 #     HUMAN_DETECTION_DETECTOR=single
 # Beats this default by 4-5x on harder flight clips but ~5x per-frame
-# latency. Bench results in outputs/bench/.
+# latency. Bench results in `outputs/bench/`.
 DEFAULT_MODEL = "finetune-multi-v3-best.pt"
 DEFAULT_TARGET_CLASSES: tuple[str, ...] = ("Person",)
 
