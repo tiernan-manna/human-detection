@@ -34,11 +34,11 @@ from human_detection.inference_worker import _build_detector
 
 def test_config_defaults_inference_imgsz_to_640():
     cfg = Config()
-    # Defaults pair with the default model `WALDO30_yolov8l-p2_640x640.pt`,
-    # which is trained natively at 640×640. Chosen for the throughput/
-    # latency budget required to run multiple simultaneous streams in
-    # production. Higher-recall configs (l-p2_1024x1024 + imgsz=1024 +
-    # detector=single) are documented on DEFAULT_MODEL as opt-in.
+    # Defaults pair with the default model `finetune-multi-v3-best.pt`
+    # (m-p2 base, fine-tuned on operator footage). Same 640×640 native
+    # resolution as the un-fine-tuned base so latency is unchanged.
+    # Higher-recall configs (l-p2_1024x1024 + imgsz=1024 + detector=single)
+    # are documented on DEFAULT_MODEL as opt-in.
     assert cfg.inference_imgsz == 640
     # SAHI is the empirically-validated default — see the comment on
     # `Config.detector_kind`. A 320×240 hover recording at 14-22 m

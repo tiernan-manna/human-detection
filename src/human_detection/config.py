@@ -11,23 +11,28 @@ import os
 from dataclasses import dataclass, field
 
 
-# `-p2` denotes the small-object detection-head variant of WALDO30. The
-# vanilla yolov8l model has detection heads at strides 8 / 16 / 32; -p2
-# adds a stride-4 head, which is materially better at the 12-30 px-tall
-# people we see at typical delivery altitudes on a 320x240 source feed.
-# Stephan (WALDO author) was explicit: "you definitely need to use the
-# -p2 model variants, those are way better at small objects like people".
+# Default is the most-recent fine-tune of `WALDO30_yolov8m_p2_640x640.pt`
+# on operator footage with point-supervision pseudo-bboxes (see
+# scripts/finetune.py). Runs at the same 640 native resolution + SAHI
+# tiling as the un-fine-tuned base, so latency is identical (~70 ms/frame
+# on M3 MPS) — leaves throughput headroom for multi-stream pilot
+# operation (10 simultaneous streams feasible on modest server-class
+# hardware at this latency).
 #
-# Default is the 640x640-trained l-p2 variant. Auto-downloaded on first
-# run (~50 MB), runs ~70 ms/frame on M3 MPS — leaves throughput headroom
-# for multi-stream pilot operation (10 simultaneous streams is feasible
-# on modest server-class hardware at this latency).
+# This is a LOCAL-ONLY artifact: not on HuggingFace, must be present at
+# `models/finetune-multi-v3-best.pt`. Production deploys are expected
+# to bundle it in their artifact. If it's missing on a fresh install,
+# `model_download.ensure_model` falls back to
+# `WALDO30_yolov8l-p2_640x640.pt` with a loud warning so the sidecar
+# still works — see model_download.py.
 #
-# Higher-recall opt-in: `WALDO30_yolov8l-p2_1024x1024.pt` + imgsz=1024
-# + detector=single. Beats this default by 4-5x on harder flight clips
-# but costs ~5x per-frame latency, so single-stream only on consumer
-# hardware. Bench results in outputs/bench/.
-DEFAULT_MODEL = "WALDO30_yolov8l-p2_640x640.pt"
+# Higher-recall opt-in (single-stream only):
+#     HUMAN_DETECTION_MODEL=WALDO30_yolov8l-p2_1024x1024.pt
+#     HUMAN_DETECTION_IMGSZ=1024
+#     HUMAN_DETECTION_DETECTOR=single
+# Beats this default by 4-5x on harder flight clips but ~5x per-frame
+# latency. Bench results in outputs/bench/.
+DEFAULT_MODEL = "finetune-multi-v3-best.pt"
 DEFAULT_TARGET_CLASSES: tuple[str, ...] = ("Person",)
 
 
