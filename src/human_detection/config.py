@@ -17,12 +17,21 @@ from dataclasses import dataclass, field
 # people we see at typical delivery altitudes on a 320x240 source feed.
 # Stephan (WALDO author) was explicit: "you definitely need to use the
 # -p2 model variants, those are way better at small objects like people".
-# Drop-in replacement at the same 640x640 training resolution, ~+15%
-# inference cost vs the non-p2 yolov8l. For maximum recall on small
-# targets, override to `WALDO30_yolov8l-p2_1024x1024.pt` AND set
-# `HUMAN_DETECTION_IMGSZ=1024` so the model runs at the resolution it
-# was trained at — see Config.inference_imgsz docstring.
-DEFAULT_MODEL = "WALDO30_yolov8l-p2_640x640.pt"
+#
+# Default is the 1024x1024-trained variant + native single-pass inference
+# at imgsz=1024. Empirically this gives the highest TP recall in the
+# regime we operate in — see scripts/benchmark_recording.py results in
+# outputs/bench/. On the three flight clips (June 2026 baseline) it
+# beats the 640x640 m-p2 fine-tune by 4-5x on flight-test and hover, and
+# is only marginally behind on the grass clip. Cost: ~5x per-frame
+# latency vs the 640 model (~360 ms vs ~70 ms on M3 MPS).
+#
+# To get back to the smaller/faster model for development on
+# constrained hardware, override:
+#     HUMAN_DETECTION_MODEL=WALDO30_yolov8l-p2_640x640.pt
+#     HUMAN_DETECTION_IMGSZ=640
+#     HUMAN_DETECTION_DETECTOR=sahi
+DEFAULT_MODEL = "WALDO30_yolov8l-p2_1024x1024.pt"
 DEFAULT_TARGET_CLASSES: tuple[str, ...] = ("Person",)
 
 
@@ -381,42 +390,38 @@ class Config:
     # objects (people seen from altitude), at a roughly quadratic cost
     # in latency.
     #
-    # The default WALDO model (yolov8l-p2 @ 640x640) is trained at 640
-    # so that's the sweet spot for accuracy/throughput parity. Two
-    # higher-recall opt-ins for low-resolution feeds (e.g. 320x240
-    # delivery streams where people are 12-30 px tall):
-    #   1. Cheap: keep the 640-trained model, raise imgsz to 1280 or
-    #      1920. Ultralytics will infer at the larger size with a small
-    #      accuracy hit from running off-distribution.
-    #   2. Best: switch to `WALDO30_yolov8l-p2_1024x1024.pt` AND set
-    #      this to 1024. The model was trained natively at 1024 so
-    #      it hits the small-object regime where the -p2 head shines,
-    #      without the off-distribution penalty. ~2.5x slower than the
-    #      640 default — only viable if your hardware has the headroom.
-    inference_imgsz: int = 640
+    # Default is 1024 to match `WALDO30_yolov8l-p2_1024x1024.pt`
+    # (the default model). Running the 1024-trained model at its native
+    # resolution gives the highest TP recall on our 320x240 delivery
+    # feed — empirically beats the 640 m-p2 fine-tune by 4-5x on the
+    # harder flight clips. ~5x slower than 640 mode (~360 ms vs ~70 ms
+    # on M3 MPS) — fine for single-stream pilot use, may need a beefier
+    # server for multi-stream production.
+    #
+    # If you need to fall back to the faster 640 path, override with
+    # `HUMAN_DETECTION_IMGSZ=640` AND swap the model to
+    # `WALDO30_yolov8l-p2_640x640.pt` so model resolution matches imgsz.
+    inference_imgsz: int = 1024
 
     # --- Detector selection ------------------------------------------------
-    # "single" = one forward pass per frame (fast, matches WALDO's training
-    # resolution). "sahi"   = sliced inference via SAHI; runs the model on
-    # overlapping tiles of the frame and merges with NMS.
+    # "single" = one forward pass per frame at `inference_imgsz`. Best
+    # match for models trained natively at the same resolution being used
+    # — feeding the model the whole letterboxed frame is on-distribution.
+    # "sahi"   = sliced inference via SAHI; runs the model on overlapping
+    # tiles of the frame and merges with NMS. Useful when the native
+    # model resolution is smaller than what you want to see (e.g. running
+    # a 640-trained model effectively at 1280+ via tiling).
     #
-    # Default is `sahi`. Established empirically on operator footage:
-    # benchmarking against 331 ground-truth labels from a 320×240 hover
-    # recording at 14-22 m altitude (subjects ~10-25 px tall),
-    # `single` mode hit 40% upper-bound recall while `sahi` (320 px tiles,
-    # 0.2 overlap) hit 73%. See `scripts/benchmark_label_recall.py`.
-    # Median top-detection confidence also rose from 0.10 → 0.18,
-    # meaning more of those detections survive the gates downstream.
-    # Latency cost was modest on Apple MPS — 187 ms vs 109 ms — well
-    # under the budget for the 1-2 Hz refresh the pilot UI consumes.
+    # Default is `single` to match the default model+imgsz pairing
+    # (`WALDO30_yolov8l-p2_1024x1024.pt` at imgsz=1024). On the June 2026
+    # benchmark the single-pass 1024-native config beats SAHI at imgsz=640
+    # on TP recall by 4-5x on harder clips (see outputs/bench/).
     #
-    # When `single` is appropriate: deployments where source resolution
-    # is high (1080p+) AND subjects are large (a person filling a
-    # significant fraction of the frame), AND latency is at a premium.
-    # In that regime SAHI doesn't add recall and just costs cycles.
-    # Override via HUMAN_DETECTION_DETECTOR=single if you want the
-    # legacy behaviour. Validated at startup; an unknown value raises.
-    detector_kind: str = "sahi"
+    # Override via `HUMAN_DETECTION_DETECTOR=sahi` if you've swapped to a
+    # 640-trained model (then SAHI tiling at 320×320 effectively zooms
+    # the model into 2x sub-regions and recovers some small-object recall).
+    # Validated at startup; an unknown value raises.
+    detector_kind: str = "single"
     # SAHI tile size in pixels. 320 is a good starting point for the
     # 640×640 WALDO model (each tile is "natively" sized for the network
     # input, no internal letterboxing). Smaller = more tiles = better
@@ -606,7 +611,12 @@ class Config:
                 os.getenv("HUMAN_DETECTION_TRACK_LOST_BUFFER", "15")
             ),
             track_iou_threshold=float(
-                os.getenv("HUMAN_DETECTION_TRACK_IOU", "0.6")
+                # Must match the dataclass default above (0.95). The old "0.6"
+                # fallback was a stale leftover from before the bump, so the
+                # running sidecar (which uses from_env) was silently tracking
+                # at 0.6 — the value the field comment calls "our previous 0.6"
+                # — instead of the intended 0.95.
+                os.getenv("HUMAN_DETECTION_TRACK_IOU", "0.95")
             ),
             track_stale_reset_secs=float(
                 os.getenv("HUMAN_DETECTION_TRACK_STALE_SECS", "8.0")
@@ -696,9 +706,9 @@ class Config:
             ),
             recordings_dir=os.getenv("HUMAN_DETECTION_RECORDINGS_DIR", "recordings"),
             inference_imgsz=int(
-                os.getenv("HUMAN_DETECTION_IMGSZ", "640")
+                os.getenv("HUMAN_DETECTION_IMGSZ", "1024")
             ),
-            detector_kind=os.getenv("HUMAN_DETECTION_DETECTOR", "sahi"),
+            detector_kind=os.getenv("HUMAN_DETECTION_DETECTOR", "single"),
             sahi_slice_size=int(
                 os.getenv("HUMAN_DETECTION_SAHI_SLICE_SIZE", "320")
             ),
