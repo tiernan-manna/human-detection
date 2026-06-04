@@ -35,7 +35,14 @@ from human_detection.inference_worker import _build_detector
 def test_config_defaults_inference_imgsz_to_640():
     cfg = Config()
     assert cfg.inference_imgsz == 640
-    assert cfg.detector_kind == "single"
+    # SAHI is the empirically-validated default — see the comment on
+    # `Config.detector_kind`. A 320×240 hover recording at 14-22 m
+    # altitude with 331 ground-truth labels showed 73% upper-bound
+    # recall under SAHI vs 40% under single-pass; latency cost on
+    # MPS was 187 ms vs 109 ms (well within the 1-2 Hz pilot UI
+    # budget), so the trade is dominantly favourable for the
+    # operator's use case.
+    assert cfg.detector_kind == "sahi"
     assert cfg.sahi_slice_size == 320
     assert cfg.sahi_slice_overlap == pytest.approx(0.2)
 
