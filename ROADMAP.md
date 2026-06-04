@@ -30,29 +30,41 @@ config pushed to the client.
 **Risk:** Low. Guardrails: the max/min tuples are clamped so a wrong click
 can't turn the system off or spam false positives.
 
-### 3. Confidence smoothing over track lifetime
-**Why:** Per-frame confidence jitters noticeably at ~1 Hz. A track that
-wobbles between 0.25 and 0.35 looks unstable on the UI even though it's
-unambiguously the same person.
-**Shape:** Maintain an EMA of confidence per `track_id` in the worker;
-emit the smoothed value instead of the raw one. Tiny addition to
-`_UavState.track_seen_counts` bookkeeping.
-**Risk:** Low. Pure post-processing, doesn't affect gate decisions.
+### 3. ~~Confidence smoothing over track lifetime~~ — **DONE**
+Shipped as part of the per-track motion shaping work (see `_UavState.track_conf_ema`
++ `_smooth_track_confidence` in `inference_worker.py`). Per-`track_id` EMA of
+emitted confidence; gated by `HUMAN_DETECTION_TRACK_CONF_SMOOTHING` so it can be
+A/B'd. Pure post-processing, doesn't affect gate decisions.
 
 ### 4. Detection persistence buffer
 **Why:** When ByteTrack loses a track for a frame (e.g. brief occlusion
-behind a tree), the box disappears then reappears — visual flicker. The
-lost_track_buffer keeps the tracker state alive; we could keep the last
-known box drawn on screen too, dimmed, for N frames.
-**Shape:** Client-side only: in `VideoQuic`, keep a per-`trackId` "last
-seen" ring buffer and draw fading boxes. No sidecar change.
-**Risk:** Low. Adjustable fade count; zero-cost when detection is off.
+behind a tree, baked-in HUD crosshair, model recall variance), the box
+disappears then reappears — visual flicker. The lost_track_buffer keeps
+the tracker state alive; we could keep the last known box drawn on
+screen too, dimmed, for N frames. Complements the
+`track_motion_persistent_trust_enabled` gate-bypass (which protects
+detections the model DOES return on a static subject) by covering the
+case where the model returns nothing at all for a frame or two.
+**Shape:** Two viable options:
+  * **Client-side fade** (cheaper): in `VideoQuic`, keep a per-`trackId`
+    "last seen" ring buffer and draw fading boxes. No sidecar change.
+  * **Server-side prediction** (more accurate): emit a Kalman-predicted
+    box from `_run_inference` whenever ByteTrack has a track in its
+    lost pool but produced no current-frame match. Bounded by
+    `track_lost_buffer_frames` or a separate "predicted-only" budget so
+    ghosts decay quickly when the track genuinely left.
+**Risk:** Low for the client-side fade; medium for server-side
+prediction (ghost boxes if the subject genuinely left frame — mitigate
+with a visual differentiator + tight emission budget).
 
 ## Needs real delivery footage
 
 ### 5. Altitude-aware min box size
 At 50 m AGL a person is ~4x smaller than at 14 m. Fixed
-`min_box_fraction=0.02` is a compromise; altitude-scaled would be tighter.
+`min_box_fraction=0.04` (raised from `0.02` after real Manna footage
+showed small floor objects dominating the FP profile) is a compromise;
+altitude-scaled would be tighter at low altitude / more permissive at
+high altitude.
 **Blocker:** Need the camera's vertical FOV + sensor pixel count to
 compute the expected ground-sample distance. Ideally a handful of real
 frames at known altitudes to calibrate.
@@ -113,6 +125,13 @@ could estimate the pixel shift expected between frames given altitude +
 yaw rate + velocity, and compensate before ByteTrack does IoU matching.
 Would let us tighten `track_iou_threshold` for better tracker
 discrimination during fast manoeuvres.
+
+Has a second motivation now: the new per-track motion gate
+(`_apply_track_motion_gate` in `inference_worker.py`) is hover-scoped
+specifically because cruise-mode image-space displacement is dominated
+by camera motion. With CMC subtracted, the same gate could fire during
+cruise too and start suppressing the persistent FPs that survive there
+(bushes, statues, pool covers along the flight path).
 **Risk:** Medium. Mathematical complexity; wrong model = worse tracking.
 **Blocker:** Unnecessary unless tracker association actually breaks down
 during real manoeuvres. Wait for data.
@@ -144,8 +163,10 @@ hardware (≥ 1.5× demand for safety during thermal throttle / spikes).
   available). Must cover: clear daylight, dusk, hover, cruise, with and
   without people / pets.
 - [ ] Record current accuracy numbers (precision, recall, box IoU) on the
-  set using `WALDO30_yolov8l_640x640.pt` @ MPS. This is the baseline
-  every optimisation must justify itself against.
+  set using `WALDO30_yolov8l-p2_640x640.pt` @ MPS (the post-Stephan
+  default — the older `WALDO30_yolov8l_640x640.pt` is no longer
+  representative of what production runs). This is the baseline every
+  optimisation must justify itself against.
 - [ ] Run the same benchmark on the identified pilot PC to get a real
   `capacity fps` number.
 - [ ] Nothing else in this section should be committed before these
