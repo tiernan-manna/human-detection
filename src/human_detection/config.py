@@ -18,20 +18,16 @@ from dataclasses import dataclass, field
 # Stephan (WALDO author) was explicit: "you definitely need to use the
 # -p2 model variants, those are way better at small objects like people".
 #
-# Default is the 1024x1024-trained variant + native single-pass inference
-# at imgsz=1024. Empirically this gives the highest TP recall in the
-# regime we operate in — see scripts/benchmark_recording.py results in
-# outputs/bench/. On the three flight clips (June 2026 baseline) it
-# beats the 640x640 m-p2 fine-tune by 4-5x on flight-test and hover, and
-# is only marginally behind on the grass clip. Cost: ~5x per-frame
-# latency vs the 640 model (~360 ms vs ~70 ms on M3 MPS).
+# Default is the 640x640-trained l-p2 variant. Auto-downloaded on first
+# run (~50 MB), runs ~70 ms/frame on M3 MPS — leaves throughput headroom
+# for multi-stream pilot operation (10 simultaneous streams is feasible
+# on modest server-class hardware at this latency).
 #
-# To get back to the smaller/faster model for development on
-# constrained hardware, override:
-#     HUMAN_DETECTION_MODEL=WALDO30_yolov8l-p2_640x640.pt
-#     HUMAN_DETECTION_IMGSZ=640
-#     HUMAN_DETECTION_DETECTOR=sahi
-DEFAULT_MODEL = "WALDO30_yolov8l-p2_1024x1024.pt"
+# Higher-recall opt-in: `WALDO30_yolov8l-p2_1024x1024.pt` + imgsz=1024
+# + detector=single. Beats this default by 4-5x on harder flight clips
+# but costs ~5x per-frame latency, so single-stream only on consumer
+# hardware. Bench results in outputs/bench/.
+DEFAULT_MODEL = "WALDO30_yolov8l-p2_640x640.pt"
 DEFAULT_TARGET_CLASSES: tuple[str, ...] = ("Person",)
 
 
@@ -390,18 +386,18 @@ class Config:
     # objects (people seen from altitude), at a roughly quadratic cost
     # in latency.
     #
-    # Default is 1024 to match `WALDO30_yolov8l-p2_1024x1024.pt`
-    # (the default model). Running the 1024-trained model at its native
-    # resolution gives the highest TP recall on our 320x240 delivery
-    # feed — empirically beats the 640 m-p2 fine-tune by 4-5x on the
-    # harder flight clips. ~5x slower than 640 mode (~360 ms vs ~70 ms
-    # on M3 MPS) — fine for single-stream pilot use, may need a beefier
-    # server for multi-stream production.
+    # Default 640 matches the default model `WALDO30_yolov8l-p2_640x640.pt`,
+    # so the model runs at the resolution it was trained at — sweet spot
+    # for accuracy/throughput parity. Roughly 70 ms/frame on M3 MPS;
+    # ~3x throughput headroom over the 1-2 Hz pilot UI refresh budget,
+    # which is what makes 10-simultaneous-stream production feasible.
     #
-    # If you need to fall back to the faster 640 path, override with
-    # `HUMAN_DETECTION_IMGSZ=640` AND swap the model to
-    # `WALDO30_yolov8l-p2_640x640.pt` so model resolution matches imgsz.
-    inference_imgsz: int = 1024
+    # Higher-recall opt-in for the same model: raise to 1280 or 1920.
+    # Ultralytics will infer at the larger size with a small accuracy
+    # hit from running off-distribution. Best-recall opt-in: switch to
+    # `WALDO30_yolov8l-p2_1024x1024.pt` AND set imgsz=1024 AND
+    # detector=single — see DEFAULT_MODEL comment.
+    inference_imgsz: int = 640
 
     # --- Detector selection ------------------------------------------------
     # "single" = one forward pass per frame at `inference_imgsz`. Best
@@ -409,19 +405,23 @@ class Config:
     # — feeding the model the whole letterboxed frame is on-distribution.
     # "sahi"   = sliced inference via SAHI; runs the model on overlapping
     # tiles of the frame and merges with NMS. Useful when the native
-    # model resolution is smaller than what you want to see (e.g. running
-    # a 640-trained model effectively at 1280+ via tiling).
+    # model resolution is smaller than what you want to see.
     #
-    # Default is `single` to match the default model+imgsz pairing
-    # (`WALDO30_yolov8l-p2_1024x1024.pt` at imgsz=1024). On the June 2026
-    # benchmark the single-pass 1024-native config beats SAHI at imgsz=640
-    # on TP recall by 4-5x on harder clips (see outputs/bench/).
+    # Default is `sahi`. Established empirically on operator footage:
+    # benchmarking against 331 ground-truth labels from a 320×240 hover
+    # recording at 14-22 m altitude (subjects ~10-25 px tall),
+    # `single` mode hit 40% upper-bound recall while `sahi` (320 px tiles,
+    # 0.2 overlap) hit 73%. See `scripts/benchmark_label_recall.py`.
+    # Median top-detection confidence also rose from 0.10 → 0.18,
+    # meaning more of those detections survive the gates downstream.
+    # Latency cost was modest on Apple MPS — 187 ms vs 109 ms — well
+    # under the budget for the 1-2 Hz refresh the pilot UI consumes.
     #
-    # Override via `HUMAN_DETECTION_DETECTOR=sahi` if you've swapped to a
-    # 640-trained model (then SAHI tiling at 320×320 effectively zooms
-    # the model into 2x sub-regions and recovers some small-object recall).
-    # Validated at startup; an unknown value raises.
-    detector_kind: str = "single"
+    # When `single` is appropriate: deployments where source resolution
+    # is high (1080p+) AND subjects are large AND latency is at a premium,
+    # OR when running a model trained natively at a higher resolution
+    # (e.g. l-p2 1024x1024). Validated at startup; unknown values raise.
+    detector_kind: str = "sahi"
     # SAHI tile size in pixels. 320 is a good starting point for the
     # 640×640 WALDO model (each tile is "natively" sized for the network
     # input, no internal letterboxing). Smaller = more tiles = better
@@ -706,9 +706,9 @@ class Config:
             ),
             recordings_dir=os.getenv("HUMAN_DETECTION_RECORDINGS_DIR", "recordings"),
             inference_imgsz=int(
-                os.getenv("HUMAN_DETECTION_IMGSZ", "1024")
+                os.getenv("HUMAN_DETECTION_IMGSZ", "640")
             ),
-            detector_kind=os.getenv("HUMAN_DETECTION_DETECTOR", "single"),
+            detector_kind=os.getenv("HUMAN_DETECTION_DETECTOR", "sahi"),
             sahi_slice_size=int(
                 os.getenv("HUMAN_DETECTION_SAHI_SLICE_SIZE", "320")
             ),

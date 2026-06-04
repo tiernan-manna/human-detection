@@ -32,17 +32,22 @@ from human_detection.inference_worker import _build_detector
 # --- Config defaults + env override -------------------------------------
 
 
-def test_config_defaults_inference_imgsz_to_1024():
+def test_config_defaults_inference_imgsz_to_640():
     cfg = Config()
-    # Defaults pair with the default model, `WALDO30_yolov8l-p2_1024x1024.pt`,
-    # which is trained natively at 1024×1024. Single-pass at 1024 was the
-    # highest-TP-recall config on the June 2026 benchmark across all three
-    # flight clips — see outputs/bench/.
-    assert cfg.inference_imgsz == 1024
-    assert cfg.detector_kind == "single"
-    # SAHI knobs still default to sensible values for the case where an
-    # operator opts in by overriding `HUMAN_DETECTION_DETECTOR=sahi`
-    # (typically when running a smaller 640-trained model).
+    # Defaults pair with the default model `WALDO30_yolov8l-p2_640x640.pt`,
+    # which is trained natively at 640×640. Chosen for the throughput/
+    # latency budget required to run multiple simultaneous streams in
+    # production. Higher-recall configs (l-p2_1024x1024 + imgsz=1024 +
+    # detector=single) are documented on DEFAULT_MODEL as opt-in.
+    assert cfg.inference_imgsz == 640
+    # SAHI is the empirically-validated default — see the comment on
+    # `Config.detector_kind`. A 320×240 hover recording at 14-22 m
+    # altitude with 331 ground-truth labels showed 73% upper-bound
+    # recall under SAHI vs 40% under single-pass; latency cost on
+    # MPS was 187 ms vs 109 ms (well within the 1-2 Hz pilot UI
+    # budget), so the trade is dominantly favourable for the
+    # operator's use case.
+    assert cfg.detector_kind == "sahi"
     assert cfg.sahi_slice_size == 320
     assert cfg.sahi_slice_overlap == pytest.approx(0.2)
 
@@ -123,11 +128,11 @@ def empty_detections(monkeypatch):
     )
 
 
-def test_waldo_detector_passes_default_imgsz_1024(empty_detections):
+def test_waldo_detector_passes_default_imgsz_640(empty_detections):
     det, fake = _waldo_with_fake_model(Config())
     det.detect(np.zeros((240, 320, 3), dtype=np.uint8))
     assert len(fake.predict_calls) == 1
-    assert fake.predict_calls[0]["imgsz"] == 1024
+    assert fake.predict_calls[0]["imgsz"] == 640
 
 
 def test_waldo_detector_honours_custom_imgsz(empty_detections):
