@@ -147,13 +147,24 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _find_sidecar_pid(port: int) -> int | None:
-    """Return the PID of the process listening on `port`, or None.
+    """Return the PID of the WORKER process listening on `port`.
 
     Uses `lsof` rather than `psutil.net_connections(kind="inet")` because
     macOS restricts the latter to root — even for the user's own
     processes — making the Python-native path useless for non-root
     benchmark runs. `lsof -ti:<port>` works fine for a user's own
     processes without elevated privileges.
+
+    uvicorn forks a worker child that inherits the listening socket via
+    fd duplication, so `lsof -ti` returns BOTH the parent and the worker.
+    The parent is a thin supervisor that just re-execs the worker on
+    code reload — it carries none of the model weights, none of the
+    inference state, and ~10% of the worker's CPU. Reporting its RSS
+    as "the sidecar's memory" understates real footprint by ~5x.
+    We pick the heaviest-RSS process as a robust proxy for the worker;
+    if for some reason the parent grows fatter than the worker (it
+    won't on any version of uvicorn we run), we'll see it in the
+    bench summary's CPU graph and can revisit.
     """
     import subprocess
 
@@ -166,20 +177,21 @@ def _find_sidecar_pid(port: int) -> int | None:
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
-    pid_str = (out.stdout or "").strip().splitlines()
-    if not pid_str:
+    pid_lines = (out.stdout or "").strip().splitlines()
+    if not pid_lines:
         return None
-    # If multiple PIDs (e.g. a forked child), prefer the listener — the
-    # parent uvicorn process. lsof -ti gives both; iterate and pick the
-    # one whose memory_info() works under our user.
-    for line in pid_str:
+    candidates: list[tuple[int, int]] = []  # (pid, rss_bytes)
+    for line in pid_lines:
         try:
             pid = int(line)
-            psutil.Process(pid).memory_info()
-            return pid
+            rss = psutil.Process(pid).memory_info().rss
+            candidates.append((pid, rss))
         except (ValueError, psutil.Error):
             continue
-    return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates[0][0]
 
 
 def _load_frames(session_dir: Path) -> list[dict]:
