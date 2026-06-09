@@ -5,7 +5,7 @@
   // can confirm at a glance whether their browser is running the new
   // replay-mode code or a stale cached copy. If you don't see this log
   // after refreshing, your browser is serving stale demo.js from cache.
-  const DEMO_BUILD = "absent-frames-1";
+  const DEMO_BUILD = "replay-disk-fastpath-1";
   console.info(
     `[demo] human-detection demo build=${DEMO_BUILD} — per-track box extrapolation + always-visible expand button`
   );
@@ -1326,21 +1326,34 @@
         drawBoxes(tile);
       }
 
-      // Block on the JPEG bytes — cache hit returns synchronously, miss
-      // kicks off a fetch and resolves once it lands. Previously we
-      // would fire-and-forget the fetch and bail without sending, which
-      // meant every frame on the FIRST cycle through a recording was a
-      // no-op. The cache only warmed up by the time the playlist
-      // wrapped, so an operator saw fps in/out stuck at 0 until they
-      // watched the same video a second time. Awaiting here means the
-      // first cycle just runs at a slightly reduced rate while the cache
-      // primes, instead of being entirely silent.
-      const cached = await ensureReplayBytes(frame.jpegUrl);
-      if (!cached) {
-        // Fetch failed (404, network blip, etc). Advance past it so we
-        // don't loop forever on a broken frame.
-        tile.cursor = (tile.cursor + 1) % tile.playlist.length;
-        return;
+      // FAST PATH: ask the sidecar to load the JPEG directly from
+      // disk. Replay tiles only ever play frames that already live in
+      // ``recordings/<name>/frames/``, and the sidecar IS the process
+      // serving those files — so the old "fetch JPEG via HTTP, then
+      // upload it back via WS" round-trip was wasting two copies of
+      // every frame's bytes (browser <- HTTP <- disk, then browser ->
+      // WS -> server). On a 320x240 clip the round-trip dominates the
+      // per-frame budget; bypassing it bumps single-stream replay
+      // from ~6-8 fps to roughly the model's true single-stream
+      // ceiling. We send a zero-byte body and put the recording name
+      // and frame leaf in the header; the sidecar reads the file
+      // itself (path traversal is blocked by _is_safe_leaf +
+      // relative_to(), same as the /recordings HTTP routes).
+      const useDiskFastPath =
+        Boolean(tile.recordingName) && Boolean(frame.jpegLeaf);
+      let cached = null;
+      if (!useDiskFastPath) {
+        // Slow fallback for synthetic/external frame sources (the
+        // unit-test demo manifests, future S3-backed manifests etc.)
+        // where the sidecar can't see the file. Same logic as before:
+        // the cache only warms up after the first pass through a
+        // recording, so the first cycle runs at a slightly reduced
+        // rate while priming.
+        cached = await ensureReplayBytes(frame.jpegUrl);
+        if (!cached) {
+          tile.cursor = (tile.cursor + 1) % tile.playlist.length;
+          return;
+        }
       }
       // Frame might have shifted under us if the operator changed
       // tiles/recording mid-fetch. The tile would have been recreated,
@@ -1368,9 +1381,15 @@
         isDemo: true,
       };
       if (frame.telemetry) header.telemetry = frame.telemetry;
+      if (useDiskFastPath) {
+        header.recordingName = tile.recordingName;
+        header.recordingFrameLeaf = frame.jpegLeaf;
+      }
 
       try {
-        STATE.ws.send(buildEnvelope(header, cached));
+        STATE.ws.send(
+          buildEnvelope(header, useDiskFastPath ? new Uint8Array(0) : cached)
+        );
         tile.sent += 1;
         tile.lastSentAt = performance.now();
         STATE.sentSinceLastTick += 1;

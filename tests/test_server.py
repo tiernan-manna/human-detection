@@ -352,3 +352,130 @@ def test_multiple_uavs_on_same_socket(client: TestClient):
             body = json.loads(ws.receive_text())
             seen.add(body["uavId"])
         assert seen == {"uav-1", "uav-2", "uav-3"}
+
+
+@pytest.fixture
+def disk_load_client(tmp_path: Path) -> TestClient:
+    """Client whose recordings_dir is rooted at tmp_path with a session
+    that has a real JPEG on disk under frames/. Used to drive the
+    "disk fast-path" replay protocol where the WS header references
+    an existing recording leaf and the body is empty."""
+    sessions_root = tmp_path / "recordings"
+    sessions_root.mkdir()
+    session = sessions_root / "sess-disk"
+    (session / "frames").mkdir(parents=True)
+    (session / "frames" / "000001.jpg").write_bytes(_tiny_jpeg())
+    config = Config(
+        enabled=True,
+        confidence_threshold=0.1,
+        recordings_dir=str(sessions_root),
+    )
+    worker = InferenceWorker(config, detector=_EchoDetector())
+    app = create_app(config=config, worker=worker)
+    with TestClient(app) as c:
+        yield c
+
+
+def test_websocket_disk_fastpath_loads_jpeg_from_disk(disk_load_client):
+    """Replay-mode optimisation: the demo skips fetching JPEGs over HTTP
+    and re-uploading them via WS. Instead it sends an empty body plus
+    the recording name and frame leaf; the sidecar reads the file
+    itself. Validates the wire contract end-to-end."""
+    with disk_load_client.websocket_connect("/detect") as ws:
+        ws.send_bytes(
+            _envelope(
+                {
+                    "uavId": "uav-disk",
+                    "ts": 1,
+                    "isLowLight": False,
+                    "imgW": 64,
+                    "imgH": 64,
+                    "recordingName": "sess-disk",
+                    "recordingFrameLeaf": "000001.jpg",
+                    "isDemo": True,
+                },
+                b"",
+            )
+        )
+        body = json.loads(ws.receive_text())
+    assert body["uavId"] == "uav-disk"
+    assert body["ts"] == 1
+    # The echo detector returns a fixed box; if we got it back, the
+    # sidecar successfully read the JPEG from disk and ran inference.
+    assert len(body["detections"]) == 1
+
+
+def test_websocket_disk_fastpath_rejects_path_traversal(disk_load_client):
+    """A malicious recordingName must not escape the recordings root.
+    The frame is dropped silently (logged at warning level) so a real
+    next frame still works."""
+    with disk_load_client.websocket_connect("/detect") as ws:
+        ws.send_bytes(
+            _envelope(
+                {
+                    "uavId": "uav-bad",
+                    "ts": 1,
+                    "isLowLight": False,
+                    "imgW": 64,
+                    "imgH": 64,
+                    # Both the name and the leaf are validated through
+                    # _is_safe_leaf (no slashes / dots / ..); a follow-up
+                    # send with a clean header must still produce a reply.
+                    "recordingName": "../etc",
+                    "recordingFrameLeaf": "passwd",
+                    "isDemo": True,
+                },
+                b"",
+            )
+        )
+        # Now send a clean inline-JPEG frame to confirm the socket is alive.
+        ws.send_bytes(
+            _envelope(
+                {
+                    "uavId": "uav-ok",
+                    "ts": 2,
+                    "isLowLight": False,
+                    "imgW": 64,
+                    "imgH": 64,
+                },
+                _tiny_jpeg(),
+            )
+        )
+        body = json.loads(ws.receive_text())
+    assert body["uavId"] == "uav-ok"
+
+
+def test_websocket_disk_fastpath_unknown_recording_is_rejected(disk_load_client):
+    """If the named recording or leaf doesn't exist, the frame is
+    silently dropped (parser raises ValueError, handler logs and
+    continues). The next frame still works."""
+    with disk_load_client.websocket_connect("/detect") as ws:
+        ws.send_bytes(
+            _envelope(
+                {
+                    "uavId": "uav-missing",
+                    "ts": 1,
+                    "isLowLight": False,
+                    "imgW": 64,
+                    "imgH": 64,
+                    "recordingName": "sess-disk",
+                    "recordingFrameLeaf": "999999.jpg",
+                    "isDemo": True,
+                },
+                b"",
+            )
+        )
+        ws.send_bytes(
+            _envelope(
+                {
+                    "uavId": "uav-ok-after",
+                    "ts": 2,
+                    "isLowLight": False,
+                    "imgW": 64,
+                    "imgH": 64,
+                },
+                _tiny_jpeg(),
+            )
+        )
+        body = json.loads(ws.receive_text())
+    assert body["uavId"] == "uav-ok-after"

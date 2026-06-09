@@ -110,6 +110,12 @@ class WaldoDetector:
         # WALDO's default 640x640 still leaves them at the bottom of
         # YOLO's reliable detection range.
         self._imgsz = max(32, int(config.inference_imgsz))
+        # FP16 inference. Honoured on cuda/mps; ignored on cpu where
+        # PyTorch's CPU half-precision path is either slow (x86) or
+        # broken on some macOS builds. The Ultralytics `half=` kwarg
+        # silently falls back to FP32 in those cases, but we mask it
+        # explicitly so the boolean we pass downstream tells the truth.
+        self._half = bool(config.inference_half) and self._device != "cpu"
 
     def _load(self) -> None:
         if self._model is not None:
@@ -151,6 +157,7 @@ class WaldoDetector:
             conf=self._config.confidence_threshold,
             device=self._device,
             imgsz=self._imgsz,
+            half=self._half,
             verbose=False,
         )
         detections = sv.Detections.from_ultralytics(results[0])
@@ -192,6 +199,7 @@ class WaldoDetector:
                 conf=self._config.confidence_threshold,
                 device=self._device,
                 imgsz=self._imgsz,
+                half=self._half,
                 verbose=False,
             )
 

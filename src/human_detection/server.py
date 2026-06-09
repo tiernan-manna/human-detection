@@ -204,7 +204,7 @@ def create_app(
             while True:
                 raw = await ws.receive_bytes()
                 try:
-                    job, is_demo = _decode_frame(raw, reply)
+                    job, is_demo = _decode_frame(raw, reply, recorder=recorder)
                 except ValueError as e:
                     log.warning("rejecting malformed frame: %s", e)
                     continue
@@ -433,6 +433,13 @@ def _register_recording_routes(app: FastAPI, recorder: Recorder) -> None:
                         "imgW": int(rec.get("img_w", 0)),
                         "imgH": int(rec.get("img_h", 0)),
                         "jpegUrl": f"/recordings/{name}/{jpeg_rel}",
+                        # Bare JPEG filename (e.g. "000123.jpg"); the
+                        # demo's replay loop sends this in the WS
+                        # header so the sidecar can read the file
+                        # straight from disk and skip the
+                        # browser-fetches-then-uploads round-trip.
+                        # Already _is_safe_leaf-validated above.
+                        "jpegLeaf": jpeg_leaf,
                         "telemetry": rec.get("telemetry"),
                         "liveResult": live_results.get(seq),
                     }
@@ -797,13 +804,37 @@ def _wrap_reply_for_recording(job: FrameJob, recorder: Recorder, seq: int) -> Fr
     )
 
 
-def _decode_frame(raw: bytes, reply) -> tuple[FrameJob, bool]:
+def _decode_frame(
+    raw: bytes,
+    reply,
+    recorder: Recorder | None = None,
+) -> tuple[FrameJob, bool]:
     """Parse a binary WS message. See module docstring for the envelope.
 
     Returns the FrameJob plus the optional ``isDemo`` flag from the header.
     The flag is consumed by the WS handler (to keep synthetic frames out of
     the live monitor / recorder) and is not propagated into the inference
     worker, which doesn't care where a frame came from.
+
+    Two payload shapes are accepted:
+
+    1. **Inline JPEG (default).** The bytes after the header are the JPEG
+       to score. Used by manna-dash, demo still mode, and any external
+       producer.
+
+    2. **Disk-loaded JPEG (replay-mode optimisation).** Header includes
+       ``recordingName`` (str) and ``recordingFrameLeaf`` (str, e.g.
+       ``"000123.jpg"``) and the bytes after the header are EMPTY.
+       The server reads the JPEG straight from
+       ``recordings/<name>/frames/<leaf>``. This skips the
+       browser-fetches-from-HTTP, then-uploads-via-WS round-trip the
+       demo's replay mode used to do — on a 320 KB JPEG that round-trip
+       is the dominant cost of the per-frame pipeline. Path traversal
+       is gated by the same _is_safe_leaf / _resolve_session_dir
+       helpers used by the /recordings/* HTTP routes, so a malicious
+       header can't escape the recordings root. The recorder is the
+       only component that knows where ``recordings/`` lives, so it's
+       passed in by the WS handler.
     """
     if len(raw) < HEADER_LEN_STRUCT.size:
         raise ValueError("frame shorter than header length prefix")
@@ -827,6 +858,42 @@ def _decode_frame(raw: bytes, reply) -> tuple[FrameJob, bool]:
         img_h = int(header.get("imgH", 0))
     except (KeyError, TypeError, ValueError) as e:
         raise ValueError(f"missing/invalid header field: {e}") from e
+
+    rec_name = header.get("recordingName")
+    rec_leaf = header.get("recordingFrameLeaf")
+    if not jpeg and rec_name and rec_leaf:
+        if recorder is None:
+            raise ValueError(
+                "recordingName/recordingFrameLeaf set but server has no "
+                "recorder bound (this should not happen)"
+            )
+        if not isinstance(rec_name, str) or not isinstance(rec_leaf, str):
+            raise ValueError("recordingName/recordingFrameLeaf must be strings")
+        if not _is_safe_leaf(rec_name):
+            raise ValueError(f"unsafe recordingName: {rec_name!r}")
+        if not _is_safe_leaf(rec_leaf):
+            raise ValueError(f"unsafe recordingFrameLeaf: {rec_leaf!r}")
+        ext = rec_leaf.lower().rsplit(".", 1)[-1]
+        if ext not in {"jpg", "jpeg", "png"}:
+            raise ValueError(f"recordingFrameLeaf must be image: {rec_leaf!r}")
+        try:
+            session_dir = _resolve_session_dir(recorder, rec_name)
+        except HTTPException as e:
+            raise ValueError(f"recording not found: {rec_name}") from e
+        target = (session_dir / "frames" / rec_leaf).resolve()
+        try:
+            target.relative_to(session_dir.resolve())
+        except ValueError as e:
+            raise ValueError("recordingFrameLeaf path traversal") from e
+        if not target.is_file():
+            raise ValueError(
+                f"recording frame not found: {rec_name}/{rec_leaf}"
+            )
+        try:
+            jpeg = target.read_bytes()
+        except OSError as e:
+            raise ValueError(f"failed to read recording frame: {e}") from e
+
     if not jpeg:
         raise ValueError("empty JPEG payload")
     is_demo = bool(header.get("isDemo", False))

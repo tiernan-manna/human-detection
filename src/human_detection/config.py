@@ -39,10 +39,9 @@ from dataclasses import dataclass, field
 #      If it's also a local-only fine-tune, repeat the .gitignore-
 #      exception pattern with the new filename.
 #
-# Higher-recall opt-in (single-stream only):
+# Higher-recall opt-in (single-stream only, much higher latency):
 #     HUMAN_DETECTION_MODEL=WALDO30_yolov8l-p2_1024x1024.pt
 #     HUMAN_DETECTION_IMGSZ=1024
-#     HUMAN_DETECTION_DETECTOR=single
 # Beats this default by 4-5x on harder flight clips but ~5x per-frame
 # latency. Bench results in `outputs/bench/`.
 DEFAULT_MODEL = "finetune-multi-v3-best.pt"
@@ -417,6 +416,28 @@ class Config:
     # detector=single — see DEFAULT_MODEL comment.
     inference_imgsz: int = 640
 
+    # --- FP16 (half-precision) inference ----------------------------------
+    # When True, the model is run with half-precision floats. Default
+    # ON after benching on the v3 fine-tune (2026-06-09): ZERO change
+    # in TP/FP counts on the three labelled clips (grass / hover /
+    # flight-test) at threshold 0.20, while mean per-frame inference
+    # latency dropped 12–35%:
+    #
+    #   clip            FP32 mean   FP16 mean   delta
+    #   grass            84 ms       54 ms      -36%
+    #   hover           103 ms       89 ms      -14%
+    #   flight-test     100 ms       88 ms      -12%
+    #
+    # Single-stream uncapped throughput moved from 12.65 fps to 13.15
+    # fps. Bench artifacts: outputs/bench/acc-{sahi-on,sahi-off,fp16}.
+    #
+    # Disable with HUMAN_DETECTION_HALF=0 if a future model or hardware
+    # config regresses. Ignored on CPU device (PyTorch CPU FP16 is slow
+    # on x86 and broken on some macOS builds); in that case Ultralytics
+    # silently falls back to FP32 and the detector flags it via the
+    # private `_half` attribute so callers see the truth.
+    inference_half: bool = True
+
     # --- Detector selection ------------------------------------------------
     # "single" = one forward pass per frame at `inference_imgsz`. Best
     # match for models trained natively at the same resolution being used
@@ -425,21 +446,35 @@ class Config:
     # tiles of the frame and merges with NMS. Useful when the native
     # model resolution is smaller than what you want to see.
     #
-    # Default is `sahi`. Established empirically on operator footage:
-    # benchmarking against 331 ground-truth labels from a 320×240 hover
-    # recording at 14-22 m altitude (subjects ~10-25 px tall),
-    # `single` mode hit 40% upper-bound recall while `sahi` (320 px tiles,
-    # 0.2 overlap) hit 73%. See `scripts/benchmark_label_recall.py`.
-    # Median top-detection confidence also rose from 0.10 → 0.18,
-    # meaning more of those detections survive the gates downstream.
-    # Latency cost was modest on Apple MPS — 187 ms vs 109 ms — well
-    # under the budget for the 1-2 Hz refresh the pilot UI consumes.
+    # Default is `single` after re-benchmarking on the v3 fine-tune
+    # (2026-06-09). Source frames are 320×240 and the SAHI slice was
+    # 320×320, so SAHI degenerates to one tile padded to 320×320 — a
+    # smaller model input than `single` mode's 640×640 letterbox. On
+    # the three labelled clips (grass / hover / flight-test):
     #
-    # When `single` is appropriate: deployments where source resolution
-    # is high (1080p+) AND subjects are large AND latency is at a premium,
-    # OR when running a model trained natively at a higher resolution
-    # (e.g. l-p2 1024x1024). Validated at startup; unknown values raise.
-    detector_kind: str = "sahi"
+    #   clip            SAHI recall  single recall   delta
+    #   grass           15.05%       15.05%          tied
+    #   hover            3.80%        4.11%          +0.31pp
+    #   flight-test      4.13%        5.50%          +1.37pp
+    #
+    # Both configs produced ZERO false positives at threshold 0.20
+    # across all clips, so precision is unchanged. `single` is also
+    # ~30% faster on a single stream (12.6 fps vs 9.2 fps uncapped on
+    # M3 MPS) because there's only one forward pass rather than tile
+    # generation + per-tile inference + cross-tile NMS.
+    #
+    # The original SAHI-default bench (cited in commit history) was on
+    # the WALDO-30 base model BEFORE fine-tuning, where SAHI moved
+    # recall from 40% to 73%. The fine-tune adapted the model to our
+    # 320×240 input distribution, which collapsed that gap.
+    #
+    # When `sahi` is still appropriate: source resolution high enough
+    # that tiling produces meaningfully different inputs (≥720p), or
+    # subjects so small relative to the frame that a tile crop helps
+    # them dominate the model's receptive field. For our drone
+    # footage, neither holds. Validated at startup; unknown values
+    # raise.
+    detector_kind: str = "single"
     # SAHI tile size in pixels. 320 is a good starting point for the
     # 640×640 WALDO model (each tile is "natively" sized for the network
     # input, no internal letterboxing). Smaller = more tiles = better
@@ -726,7 +761,8 @@ class Config:
             inference_imgsz=int(
                 os.getenv("HUMAN_DETECTION_IMGSZ", "640")
             ),
-            detector_kind=os.getenv("HUMAN_DETECTION_DETECTOR", "sahi"),
+            inference_half=_env_bool("HUMAN_DETECTION_HALF", True),
+            detector_kind=os.getenv("HUMAN_DETECTION_DETECTOR", "single"),
             sahi_slice_size=int(
                 os.getenv("HUMAN_DETECTION_SAHI_SLICE_SIZE", "320")
             ),

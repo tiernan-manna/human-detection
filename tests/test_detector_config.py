@@ -40,16 +40,25 @@ def test_config_defaults_inference_imgsz_to_640():
     # Higher-recall configs (l-p2_1024x1024 + imgsz=1024 + detector=single)
     # are documented on DEFAULT_MODEL as opt-in.
     assert cfg.inference_imgsz == 640
-    # SAHI is the empirically-validated default — see the comment on
-    # `Config.detector_kind`. A 320×240 hover recording at 14-22 m
-    # altitude with 331 ground-truth labels showed 73% upper-bound
-    # recall under SAHI vs 40% under single-pass; latency cost on
-    # MPS was 187 ms vs 109 ms (well within the 1-2 Hz pilot UI
-    # budget), so the trade is dominantly favourable for the
-    # operator's use case.
-    assert cfg.detector_kind == "sahi"
+    # `single` is the empirically-validated default after the v3
+    # fine-tune (2026-06-09). On 320×240 source frames the SAHI slice
+    # (320×320) degenerates to one tile padded to slice size, which is
+    # smaller than `single` mode's 640 letterbox — so SAHI gives the
+    # model less to look at. Bench across grass / hover / flight-test
+    # showed `single` matched-or-beat SAHI on recall (+0pp / +0.31pp
+    # / +1.37pp), with zero FPs in both. `single` is also ~30% faster
+    # on a single stream because there's only one forward pass.
+    assert cfg.detector_kind == "single"
+    # SAHI parameters keep their previous defaults — they only
+    # apply when an operator opts into HUMAN_DETECTION_DETECTOR=sahi.
     assert cfg.sahi_slice_size == 320
     assert cfg.sahi_slice_overlap == pytest.approx(0.2)
+    # FP16 is the default after benching on the v3 fine-tune showed
+    # zero accuracy regression (TP/FP counts identical on all three
+    # labelled clips at threshold 0.20) with 12–35% lower mean
+    # per-frame inference latency. Disable with HUMAN_DETECTION_HALF=0
+    # if a future model or hardware regresses.
+    assert cfg.inference_half is True
 
 
 def test_config_from_env_reads_imgsz_and_detector(monkeypatch):
@@ -57,11 +66,13 @@ def test_config_from_env_reads_imgsz_and_detector(monkeypatch):
     monkeypatch.setenv("HUMAN_DETECTION_DETECTOR", "sahi")
     monkeypatch.setenv("HUMAN_DETECTION_SAHI_SLICE_SIZE", "512")
     monkeypatch.setenv("HUMAN_DETECTION_SAHI_SLICE_OVERLAP", "0.3")
+    monkeypatch.setenv("HUMAN_DETECTION_HALF", "0")
     cfg = Config.from_env()
     assert cfg.inference_imgsz == 1280
     assert cfg.detector_kind == "sahi"
     assert cfg.sahi_slice_size == 512
     assert cfg.sahi_slice_overlap == pytest.approx(0.3)
+    assert cfg.inference_half is False
 
 
 def test_config_debug_emit_raw_defaults_off_and_reads_env(monkeypatch):

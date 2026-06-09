@@ -117,6 +117,32 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Free-text label written into summary.json.",
     )
+    p.add_argument(
+        "--mode",
+        choices=("inline", "http-fetch", "disk-fastpath"),
+        default="inline",
+        help=(
+            "How each frame is delivered to the sidecar:\n"
+            "  inline        — read JPEG from local disk, ship as the WS body\n"
+            "                  (default; mimics manna-dash live feeds)\n"
+            "  http-fetch    — HTTP GET /recordings/<n>/frames/<leaf> first,\n"
+            "                  then ship those bytes as the WS body. Mimics\n"
+            "                  the demo's old replay path so we can A/B it\n"
+            "                  against disk-fastpath.\n"
+            "  disk-fastpath — send a zero-byte WS body with recordingName\n"
+            "                  and recordingFrameLeaf in the header; the\n"
+            "                  sidecar reads the JPEG from disk itself.\n"
+            "                  Requires the recording to live under the\n"
+            "                  sidecar's recordings_dir."
+        ),
+    )
+    p.add_argument(
+        "--recording-name",
+        default=None,
+        help="Recording leaf name as known to the sidecar's recordings_dir. "
+        "Required for --mode http-fetch and --mode disk-fastpath; defaults "
+        "to the basename of session_dir.",
+    )
     return p.parse_args()
 
 
@@ -179,9 +205,22 @@ async def _stream_worker(
     fps: float,
     duration_s: float,
     deadline: float,
+    mode: str = "inline",
+    recording_name: str | None = None,
+    sidecar_http_base: str = "http://127.0.0.1:8765",
 ) -> dict:
-    """One concurrent video feed: paces frames at `fps`, records latency."""
+    """One concurrent video feed: paces frames at `fps`, records latency.
+
+    `mode` controls how the JPEG reaches the sidecar:
+      - "inline":        local-disk read + WS body (current dashboard path)
+      - "http-fetch":    HTTP GET /recordings/<n>/frames/<leaf> + WS body
+                         (mimics the demo's pre-fastpath replay loop)
+      - "disk-fastpath": empty WS body + recordingName/leaf in header
+                         (the new replay fast path)
+    """
     import websockets
+    import urllib.request
+    import urllib.error
 
     interval = 1.0 / fps if fps > 0 else 0.0
     sent = 0
@@ -237,10 +276,45 @@ async def _stream_worker(
             if rec.get("telemetry"):
                 header["telemetry"] = rec["telemetry"]
 
+            jpeg_leaf = jpeg_rel.rsplit("/", 1)[-1]
+            payload: bytes
+            if mode == "disk-fastpath":
+                if not recording_name:
+                    raise RuntimeError(
+                        "disk-fastpath mode requires --recording-name"
+                    )
+                header["recordingName"] = recording_name
+                header["recordingFrameLeaf"] = jpeg_leaf
+                payload = b""
+            elif mode == "http-fetch":
+                if not recording_name:
+                    raise RuntimeError(
+                        "http-fetch mode requires --recording-name"
+                    )
+                # The browser pulls JPEGs over HTTP from the sidecar
+                # before re-uploading them via WS — synchronously, in
+                # series. We emulate that here so the round-trip
+                # bottleneck shows up in the bench. urllib.request is
+                # blocking, but a single HTTP GET to localhost is fast
+                # enough that running it inline in the asyncio loop
+                # doesn't materially change the picture for the case
+                # the bench is measuring (≤6 streams).
+                url = (
+                    f"{sidecar_http_base}/recordings/"
+                    f"{recording_name}/frames/{jpeg_leaf}"
+                )
+                try:
+                    with urllib.request.urlopen(url, timeout=5) as r:
+                        payload = r.read()
+                except (urllib.error.URLError, OSError):
+                    continue
+            else:  # inline
+                payload = jpeg_path.read_bytes()
+
             fut: asyncio.Future = asyncio.get_running_loop().create_future()
             pending[ts] = (fut, time.monotonic())
             try:
-                await ws.send(_envelope(header, jpeg_path.read_bytes()))
+                await ws.send(_envelope(header, payload))
                 sent += 1
             except websockets.ConnectionClosed:
                 break
@@ -360,6 +434,11 @@ async def _run() -> int:
         _resource_sampler(pid, args.sample_interval, deadline, samples)
     )
 
+    recording_name = args.recording_name or session_dir.name
+    sidecar_http_base = (
+        args.sidecar.replace("ws://", "http://").rsplit("/", 1)[0]
+    )
+
     workers = [
         asyncio.create_task(
             _stream_worker(
@@ -371,6 +450,9 @@ async def _run() -> int:
                 fps=args.fps,
                 duration_s=args.duration,
                 deadline=deadline,
+                mode=args.mode,
+                recording_name=recording_name,
+                sidecar_http_base=sidecar_http_base,
             )
         )
         for i in range(args.streams)
@@ -394,6 +476,7 @@ async def _run() -> int:
         "session": session_dir.name,
         "streams": args.streams,
         "target_fps_per_stream": args.fps,
+        "mode": args.mode,
         "duration_s": args.duration,
         "sidecar_pid": pid,
         "sidecar_cpu_mean_pct": (
