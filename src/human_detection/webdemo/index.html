@@ -125,6 +125,14 @@
         frames
         <input type="number" id="bench-frames" min="20" max="2000" step="10" value="200" />
       </label>
+      <label title="Concurrent streams to simulate. 1 = serial latency A/B vs the sidecar (default). >1 = live multi-tile throughput test: this many virtual tiles each send at the Hz rate through the single shared worker, reproducing the live send path (cached fetch + main-thread decode + per-tile in-flight skip). Reports achieved vs offered FPS and drop rate — the honest 'how many live tiles can I watch' number.">
+        streams
+        <input type="number" id="bench-streams" min="1" max="40" step="1" value="1" />
+      </label>
+      <label title="Duration of the concurrent throughput test, in seconds (ignored for the 1-stream serial A/B).">
+        secs
+        <input type="number" id="bench-secs" min="5" max="120" step="5" value="20" />
+      </label>
       <label title="Pacing. 'paced' sends at the rate (Hz) control — gates see flight-like wall-clock timing in BOTH pipelines, so detection agreement is apples-to-apples. 'uncapped' sends each frame as soon as the previous completes — max throughput, but time-based gates (hover dwell) compress differently per pipeline, so agreement is indicative only.">
         pacing
         <select id="bench-pacing">

@@ -27,6 +27,9 @@ def main() -> int:
     ap.add_argument("--ep", default="auto")
     ap.add_argument("--precision", default=None, choices=["fp32", "fp16"])
     ap.add_argument("--bench", type=int, default=0, help="run the benchmark over N frames")
+    ap.add_argument("--streams", type=int, default=1, help="concurrent live tiles (>1 runs the throughput test)")
+    ap.add_argument("--secs", type=int, default=20, help="duration of the concurrent throughput test")
+    ap.add_argument("--hz", type=int, default=0, help="override the replay Hz before benchmarking")
     ap.add_argument("--pacing", default="paced", choices=["paced", "uncapped"])
     ap.add_argument("--frames", type=int, default=6, help="replay frames to observe")
     ap.add_argument("--timeout", type=float, default=180.0)
@@ -101,8 +104,13 @@ def main() -> int:
         for k, v in stats.items():
             print(f"{k:18s} {v}")
 
-        if args.bench > 0:
-            page.fill("#bench-frames", str(args.bench))
+        if args.hz > 0:
+            page.fill("#ctl-hz", str(args.hz))
+
+        if args.bench > 0 or args.streams > 1:
+            page.fill("#bench-frames", str(max(20, args.bench)))
+            page.fill("#bench-streams", str(args.streams))
+            page.fill("#bench-secs", str(args.secs))
             page.select_option("#bench-pacing", args.pacing)
             page.click("#bench-run")
             page.wait_for_function(

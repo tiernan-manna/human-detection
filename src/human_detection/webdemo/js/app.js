@@ -32,6 +32,8 @@ const els = {
   ctlPause: document.getElementById("ctl-pause"),
   ctlReset: document.getElementById("ctl-reset"),
   benchFrames: document.getElementById("bench-frames"),
+  benchStreams: document.getElementById("bench-streams"),
+  benchSecs: document.getElementById("bench-secs"),
   benchPacing: document.getElementById("bench-pacing"),
   benchRun: document.getElementById("bench-run"),
   benchCancel: document.getElementById("bench-cancel"),
@@ -326,11 +328,14 @@ function buildTiles(count) {
       lastSidecar: null,
       lastReplyAt: 0,
       lastObjectUrl: null,
+      nextDueAt: 0,
     };
     wireScrub(tile);
     STATE.tiles.push(tile);
   }
   assignSources();
+  // Re-stagger whenever the tile set changes so a fresh grid doesn't burst.
+  if (STATE.tickTimer) assignTilePhases();
 }
 
 function wireScrub(tile) {
@@ -409,13 +414,41 @@ function assignSources() {
   });
 }
 
+// Spread each tile's send time evenly across the period so tile i first fires
+// at i/N of the way through the window. Keeps the worker queue (and the GPU,
+// which is also compositing the live tiles) from being slammed with N frames on
+// every 1 Hz boundary.
+function assignTilePhases() {
+  const hz = Math.max(1, Math.min(30, parseInt(els.ctlHz.value, 10) || 1));
+  const period = 1000 / hz;
+  const n = STATE.tiles.length || 1;
+  const base = performance.now();
+  STATE.tiles.forEach((t, i) => {
+    t.nextDueAt = base + (i * period) / n;
+  });
+}
+
 function startTicker() {
   if (STATE.tickTimer) clearInterval(STATE.tickTimer);
   const hz = Math.max(1, Math.min(30, parseInt(els.ctlHz.value, 10) || 1));
+  STATE.tickPeriod = 1000 / hz;
+  assignTilePhases();
+  // Fine-grained scheduler: each tile carries its own `nextDueAt`, so sends are
+  // phase-spread and a tile that was still in-flight at its slot sends as soon
+  // as it frees up (catch-up) instead of dropping the whole 1 Hz slot. Resolution
+  // is a fraction of the period, floored so we never busy-spin.
+  const res = Math.max(15, Math.min(STATE.tickPeriod, STATE.tickPeriod / 6));
   STATE.tickTimer = setInterval(() => {
     if (STATE.paused || !STATE.ready || STATE.bench.running) return;
-    for (const tile of STATE.tiles) tickTile(tile);
-  }, 1000 / hz);
+    const now = performance.now();
+    const period = STATE.tickPeriod;
+    for (const tile of STATE.tiles) {
+      if (tile.nextDueAt == null) tile.nextDueAt = now;
+      if (now < tile.nextDueAt || tile.inflight || tile.scrubbing) continue;
+      tile.nextDueAt = now + period;
+      tickTile(tile);
+    }
+  }, res);
 }
 
 async function tickTile(tile) {
@@ -726,6 +759,11 @@ async function runBenchmark() {
     els.benchStatus.textContent = "no recording frames available";
     return;
   }
+  const nStreams = Math.max(1, Math.min(40, parseInt(els.benchStreams.value, 10) || 1));
+  if (nStreams > 1) {
+    await runConcurrentBenchmark(src, nStreams);
+    return;
+  }
   const wanted = Math.max(20, parseInt(els.benchFrames.value, 10) || 200);
   const frames = src.frames.slice(0, wanted);
   const paced = els.benchPacing.value === "paced";
@@ -922,6 +960,238 @@ async function runBenchmark() {
     els.benchRun.disabled = false;
     els.benchCancel.hidden = true;
   }
+}
+
+// Concurrent multi-stream throughput test. Faithfully reproduces the LIVE
+// multi-tile send path — N virtual tiles each fire a frame every 1/Hz through
+// the single shared worker, with main-thread JPEG decode and the per-tile
+// in-flight skip — so the number matches what you actually see on the page
+// (achieved FPS out + dropped tiles), not the serial model ceiling.
+async function runConcurrentBenchmark(src, nStreams) {
+  const hz = Math.max(1, Math.min(30, parseInt(els.ctlHz.value, 10) || 1));
+  const secs = Math.max(5, Math.min(120, parseInt(els.benchSecs.value, 10) || 20));
+  const interval = 1000 / hz;
+  const frames = src.frames;
+  if (!frames || frames.length === 0) {
+    els.benchStatus.textContent = "no recording frames available";
+    return;
+  }
+
+  STATE.bench.running = true;
+  STATE.bench.cancelled = false;
+  els.benchRun.disabled = true;
+  els.benchCancel.hidden = false;
+  els.benchResults.hidden = true;
+  els.benchDownload.hidden = true;
+  const status = (s) => {
+    els.benchStatus.textContent = s;
+  };
+
+  try {
+    // Warm the JPEG cache so HTTP fetches never pollute the timing (in
+    // production the frames arrive in-memory from the video transport).
+    status(`preloading frames for ${nStreams} streams…`);
+    const warmCount = Math.min(frames.length, Math.ceil(hz * secs) + 5);
+    for (let i = 0; i < warmCount; i++) {
+      if (STATE.bench.cancelled) throw new Error("cancelled");
+      await fetchJpeg(frames[i % frames.length].jpegUrl);
+    }
+
+    // Warm the session so graph/shader compilation isn't counted as a drop.
+    STATE.worker.postMessage({ type: "reset" });
+    const warmBuf = await fetchJpeg(frames[0].jpegUrl);
+    for (let w = 0; w < 3; w++) {
+      const bitmap = await createImageBitmap(
+        new Blob([warmBuf], { type: "image/jpeg" })
+      );
+      const id = nextFrameId();
+      const p = new Promise((resolve, reject) => {
+        pendingResults.set(id, { resolve, reject });
+      });
+      STATE.worker.postMessage(
+        { type: "frame", id, uavId: "conc-warm", bitmap, isLowLight: false, telemetry: null },
+        [bitmap]
+      );
+      await p;
+    }
+
+    const streams = [];
+    for (let i = 0; i < nStreams; i++) {
+      streams.push({ uavId: `conc-${i}`, frameIdx: i % frames.length, inflight: false, slotDueAt: 0 });
+    }
+    let offered = 0;
+    let returned = 0;
+    let dropped = 0;
+    let failed = 0;
+    const latencies = [];
+
+    STATE.worker.postMessage({ type: "reset" });
+    const startAt = performance.now();
+    const endAt = startAt + secs * 1000;
+    // Phase-spread the slots exactly like the live ticker (assignTilePhases).
+    streams.forEach((s, i) => {
+      s.slotDueAt = startAt + (i * interval) / nStreams;
+    });
+    const res = Math.max(15, Math.min(interval, interval / 6));
+
+    await new Promise((resolveAll) => {
+      const timer = setInterval(() => {
+        const now = performance.now();
+        if (STATE.bench.cancelled || now >= endAt) {
+          clearInterval(timer);
+          resolveAll();
+          return;
+        }
+        for (const s of streams) {
+          if (now < s.slotDueAt) continue;
+          s.slotDueAt += interval; // fixed cadence, per-slot drop accounting
+          // Tile still waiting on its previous frame when this slot came up:
+          // exactly the live "missing tile" — count it and move on.
+          if (s.inflight) {
+            dropped++;
+            continue;
+          }
+          offered++;
+          s.inflight = true;
+          const id = nextFrameId();
+          const frame = frames[s.frameIdx % frames.length];
+          s.frameIdx++;
+          const t0 = performance.now();
+          pendingResults.set(id, {
+            resolve: () => {
+              s.inflight = false;
+              returned++;
+              latencies.push(performance.now() - t0);
+            },
+            reject: () => {
+              s.inflight = false;
+              failed++;
+            },
+          });
+          fetchJpeg(frame.jpegUrl)
+            .then((buf) => createImageBitmap(new Blob([buf], { type: "image/jpeg" })))
+            .then((bitmap) => {
+              STATE.worker.postMessage(
+                {
+                  type: "frame",
+                  id,
+                  uavId: s.uavId,
+                  bitmap,
+                  isLowLight: false,
+                  telemetry: frame.telemetry || null,
+                },
+                [bitmap]
+              );
+            })
+            .catch(() => {
+              const r = pendingResults.get(id);
+              pendingResults.delete(id);
+              if (r) r.reject(new Error("decode failed"));
+            });
+        }
+        const secsLeft = Math.max(0, (endAt - now) / 1000).toFixed(0);
+        status(
+          `concurrent: ${nStreams}×${hz}Hz — ${returned} out, ${dropped} dropped, ${secsLeft}s left`
+        );
+      }, res);
+    });
+
+    // Let any in-flight frames drain before reporting.
+    await sleep(Math.min(2000, interval * 2));
+
+    const elapsedS = (performance.now() - startAt) / 1000;
+    // Rates use the offer window (secs), not elapsedS, so the post-run drain
+    // sleep doesn't deflate the numbers.
+    const windowS = secs;
+    const targetFps = nStreams * hz;
+    const offeredFps = offered / windowS;
+    const achievedFps = returned / windowS;
+    const dropPct = offered + dropped > 0 ? (100 * dropped) / (offered + dropped) : 0;
+
+    const report = {
+      kind: "webdemo-concurrent-benchmark",
+      generatedAt: new Date().toISOString(),
+      recording: src.recordingName,
+      streams: nStreams,
+      hz,
+      durationS: Math.round(elapsedS),
+      browser: {
+        ep: STATE.epInfo.ep,
+        ortSource: STATE.epInfo.ortSource,
+        precision: STATE.epInfo.precision,
+        modelFile: STATE.epInfo.modelFile,
+        crossOriginIsolated: STATE.epInfo.crossOriginIsolated,
+        wasmThreads: STATE.epInfo.numThreads,
+        userAgent: navigator.userAgent,
+      },
+      targetFps,
+      offeredFps,
+      achievedFps,
+      dropPct,
+      offered,
+      returned,
+      dropped,
+      failed,
+      latencyMs: summarise(latencies),
+    };
+
+    renderConcurrentResults(report);
+    status(
+      `done — ${achievedFps.toFixed(1)}/${targetFps} fps out (${dropPct.toFixed(0)}% dropped)`
+    );
+
+    try {
+      const r = await fetch("/webdemo/bench", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(report),
+      });
+      if (r.ok) {
+        const body = await r.json();
+        status(
+          `done — ${achievedFps.toFixed(1)}/${targetFps} fps out (${dropPct.toFixed(0)}% dropped) — saved ${body.saved}`
+        );
+      }
+    } catch {
+      /* saving is best-effort */
+    }
+
+    const blob = new Blob([JSON.stringify(report, null, 2)], {
+      type: "application/json",
+    });
+    els.benchDownload.href = URL.createObjectURL(blob);
+    els.benchDownload.hidden = false;
+  } catch (err) {
+    status(String(err.message || err));
+  } finally {
+    STATE.bench.running = false;
+    els.benchRun.disabled = false;
+    els.benchCancel.hidden = true;
+  }
+}
+
+function renderConcurrentResults(r) {
+  const ok = r.dropPct < 5;
+  const cls = ok ? "good" : "warn";
+  els.benchResults.innerHTML = `
+    <div class="bench-section">concurrent throughput — ${r.streams} live tiles @ ${r.hz} Hz for ${r.durationS}s (${r.recording}, ${r.browser.ep})</div>
+    <table>
+      <tr><th>metric</th><th>value</th></tr>
+      <tr><td>offered (target) fps</td><td>${r.targetFps.toFixed(0)}</td></tr>
+      <tr><td>achieved fps out</td><td class="${cls}">${r.achievedFps.toFixed(1)}</td></tr>
+      <tr><td>frames dropped</td><td class="${cls}">${r.dropped} (${r.dropPct.toFixed(0)}%)</td></tr>
+      <tr><td>round-trip p50 / p95 (ms)</td><td>${r.latencyMs.p50.toFixed(0)} / ${r.latencyMs.p95.toFixed(0)}</td></tr>
+    </table>
+    <div class="bench-note">
+      Reproduces the live multi-tile path: ${r.streams} virtual tiles each send a
+      frame every ${(1000 / r.hz).toFixed(0)} ms through the single shared worker, with
+      main-thread JPEG decode and the per-tile in-flight skip. A frame is "dropped"
+      when a tile's next slot arrives before its previous frame returned — that's the
+      missing tiles you see. Unlike the single-stream latency test, this captures
+      main-thread contention and worker head-of-line blocking, so it reflects what the
+      live page actually delivers.
+    </div>`;
+  els.benchResults.hidden = false;
 }
 
 function computeAgreement(browserDets, sidecarDets) {
