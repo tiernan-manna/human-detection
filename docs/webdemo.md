@@ -42,18 +42,21 @@ Backend notes:
   (fp32 dynamic), i.e. ~6 streams/tab when warm. This is the path stock pilot
   machines actually use.
 - **WebNN** is ~3× faster (~53 ms warm on Apple Silicon, CoreML/ANE) but is
-  **not shipping unflagged in stable Chrome**. There are exactly two ways to
-  get it without each user editing `chrome://flags`:
-  1. **Origin Trial token** — register the deploy origin at
-     <https://developer.chrome.com/origintrials> and drop the token into the
-     `origin-trial` `<meta>` in `index.html`; every visitor then gets WebNN
-     automatically. The trial has been repeatedly disabled upstream (next
-     planned window ~M149–151), so treat it as opportunistic, not guaranteed.
-  2. **Chrome Enterprise policy** — if pilot laptops are MDM-managed, IT can
-     enable the WebNN feature fleet-wide once, with no per-user action.
-  Until one of those is in place the worker silently falls through to WebGPU.
-  (Launching Chrome with `--enable-features=WebMachineLearningNeuralNetwork`
-  is for local testing only — never something a pilot should have to do.)
+  **not shipping unflagged in stable Chrome**. The only way to give it to all
+  visitors without each user editing `chrome://flags` is a **Chrome Origin
+  Trial token**: register the deployed origin at
+  <https://developer.chrome.com/origintrials> (search "WebNN"), drop the token
+  into the `origin-trial` `<meta>` in `index.html`, and every visitor gets WebNN
+  automatically. The detector runs in a *dedicated worker*, which inherits
+  origin-trial features from the document, so the meta tag is sufficient (no
+  per-worker header needed). The trial is repeatedly disabled upstream (next
+  planned window ~M149–151), so treat it as opportunistic, not guaranteed —
+  until it's live the worker silently falls through to WebGPU.
+  - **Enterprise policy does NOT work for this.** Chrome flags/features are
+    explicitly not configurable via enterprise policy except on ChromeOS, and
+    there is no dedicated WebNN policy — so IT cannot enable it on managed
+    Windows/macOS Chrome. (Launching Chrome with
+    `--enable-features=WebMachineLearningNeuralNetwork` is local-test-only.)
 - **WASM** always works; the sidecar serves `/webdemo` with COOP/COEP
   headers so the page is `crossOriginIsolated` and the WASM fallback gets
   multi-threading.
@@ -215,9 +218,10 @@ Repro: `outputs/bench/webdemo-bench-*.json` hold the raw reports;
 - **SAHI is not ported** — the webdemo always runs single-pass inference
   (`detector_kind=waldo` equivalent). Per the feasibility doc, SAHI's
   contribution at drone altitudes is marginal; revisit if that changes.
-- **WebNN is not available flagless in stable Chrome yet** — see the backend
-  notes above for the Origin Trial / enterprise-policy paths. Stock browsers
-  transparently fall back to WebGPU, which needs no setup.
+- **WebNN is not available flagless in stable Chrome yet** — the only route to
+  give it to all visitors is a Chrome Origin Trial token (see backend notes;
+  enterprise policy cannot enable it off ChromeOS). Stock browsers transparently
+  fall back to WebGPU, which needs no setup.
 - Browser JPEG decoding differs from OpenCV's at the pixel level, so boxes
   can differ by ~1px vs the local pipeline (confidences by <0.01). All
   observed gate decisions are unaffected.
