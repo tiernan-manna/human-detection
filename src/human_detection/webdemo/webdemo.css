@@ -167,6 +167,12 @@ h1 {
 }
 .bench-results .good { color: var(--accent); }
 .bench-results .warn { color: var(--warn); }
+.bench-results .bench-note {
+  margin: 6px 0 4px;
+  color: var(--muted, #9aa);
+  font-size: 11px;
+  line-height: 1.4;
+}
 
 .boot-error {
   margin-top: 10px;

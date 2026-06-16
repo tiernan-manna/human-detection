@@ -653,11 +653,16 @@ function startStatsTicker() {
     const t = STATE.timings;
     if (t.length) {
       const totals = t.map((x) => x.totalMs).sort((a, b) => a - b);
-      const avg = totals.reduce((a, b) => a + b, 0) / totals.length;
+      // Median, not mean: a single cold-start frame (graph/shader compile) or
+      // an occasional GPU readback spike skews the mean badly on a rolling
+      // buffer, making the capacity read far lower than steady state. The
+      // median reflects the typical sustained per-frame cost, which is what
+      // actually bounds how many 1 Hz streams a tab can serve.
+      const median = totals[Math.floor(totals.length / 2)];
       const p95 = totals[Math.min(totals.length - 1, Math.floor(totals.length * 0.95))];
-      els.statAvgMs.textContent = avg.toFixed(0);
+      els.statAvgMs.textContent = median.toFixed(0);
       els.statP95Ms.textContent = p95.toFixed(0);
-      els.statCapacity.textContent = (1000 / avg).toFixed(1);
+      els.statCapacity.textContent = (1000 / median).toFixed(1);
       const mean = (k) => t.reduce((a, x) => a + x[k], 0) / t.length;
       els.statStages.textContent =
         `${mean("prepMs").toFixed(1)} / ${mean("inferMs").toFixed(1)} / ` +
@@ -726,6 +731,13 @@ async function runBenchmark() {
   const paced = els.benchPacing.value === "paced";
   const hz = Math.max(1, Math.min(30, parseInt(els.ctlHz.value, 10) || 2));
   const interval = paced ? 1000 / hz : 0;
+  // Warm-up frames to exclude from the timing stats. WebNN/WebGPU compile the
+  // graph/shaders on the first few frames (often 5-20x the steady cost), and
+  // the sidecar's first MPS inference is similarly cold. Counting those makes
+  // both look slower than they run in production, where the session is already
+  // warm. We still RUN them (so the tracker state is realistic) but drop them
+  // from every reported statistic.
+  const warmup = Math.min(10, Math.floor(frames.length * 0.15));
 
   STATE.bench.running = true;
   STATE.bench.cancelled = false;
@@ -853,19 +865,28 @@ async function runBenchmark() {
         crossOriginIsolated: STATE.epInfo.crossOriginIsolated,
         wasmThreads: STATE.epInfo.numThreads,
         userAgent: navigator.userAgent,
-        wallMs: summarise(browser.wallMs),
-        totalMs: summarise(browser.totalMs),
-        inferMs: summarise(browser.inferMs),
-        prepMs: summarise(browser.prepMs),
-        decodeMs: summarise(browser.decodeMs),
-        trackMs: summarise(browser.trackMs),
-        capacityFps: 1000 / (summarise(browser.totalMs).mean || 1),
+        warmupExcluded: warmup,
+        wallMs: summarise(browser.wallMs.slice(warmup)),
+        totalMs: summarise(browser.totalMs.slice(warmup)),
+        inferMs: summarise(browser.inferMs.slice(warmup)),
+        prepMs: summarise(browser.prepMs.slice(warmup)),
+        decodeMs: summarise(browser.decodeMs.slice(warmup)),
+        trackMs: summarise(browser.trackMs.slice(warmup)),
+        // Capacity from the MEDIAN end-to-end frame time: how many 1 Hz streams
+        // a single browser tab can serve back-to-back. This is the per-tab
+        // (per-pilot) figure, NOT the sidecar's parallel server fan-out.
+        capacityFps: 1000 / (summarise(browser.totalMs.slice(warmup)).p50 || 1),
         totalDetections: browser.detections.reduce((a, d) => a + d.length, 0),
       },
       sidecar: {
-        wallMs: summarise(sidecar.wallMs),
-        inferMs: summarise(sidecar.inferMs),
-        capacityFps: 1000 / (summarise(sidecar.inferMs).mean || 1),
+        warmupExcluded: warmup,
+        wallMs: summarise(sidecar.wallMs.slice(warmup)),
+        inferMs: summarise(sidecar.inferMs.slice(warmup)),
+        // Same basis as the browser: median end-to-end (WS round-trip) for a
+        // single serial stream. The sidecar's real production capacity is its
+        // PARALLEL fan-out (~20 streams @ 1 Hz), measured separately by
+        // scripts/benchmark_concurrent_streams.py — not this single-stream number.
+        capacityFps: 1000 / (summarise(sidecar.wallMs.slice(warmup)).p50 || 1),
         totalDetections: sidecar.detections.reduce((a, d) => a + d.length, 0),
       },
       agreement,
@@ -967,7 +988,7 @@ function renderBenchResults(r) {
   const a = r.agreement;
   const agreementClass = a.boxMatchRatePct >= 90 ? "good" : "warn";
   els.benchResults.innerHTML = `
-    <div class="bench-section">latency (ms) — ${r.frames} frames of ${r.recording}, ${r.pacing}</div>
+    <div class="bench-section">latency (ms) — ${r.frames} frames of ${r.recording}, ${r.pacing} (first ${r.browser.warmupExcluded} warm-up frames excluded)</div>
     <table>
       <tr><th>pipeline / stage</th><th>mean</th><th>p50</th><th>p95</th><th>min</th><th>max</th></tr>
       <tr><td>browser end-to-end (${r.browser.ep}, ${r.browser.precision})</td>${fmt(r.browser.totalMs)}</tr>
@@ -978,12 +999,18 @@ function renderBenchResults(r) {
       <tr><td>sidecar inference (reported)</td>${fmt(r.sidecar.inferMs)}</tr>
       <tr><td>sidecar WS round-trip</td>${fmt(r.sidecar.wallMs)}</tr>
     </table>
-    <div class="bench-section">throughput</div>
+    <div class="bench-section">throughput — single serial stream (median-based)</div>
     <table>
       <tr><th></th><th>capacity fps</th><th>total detections</th></tr>
-      <tr><td>browser</td><td>${r.browser.capacityFps.toFixed(1)}</td><td>${r.browser.totalDetections}</td></tr>
-      <tr><td>sidecar</td><td>${r.sidecar.capacityFps.toFixed(1)}</td><td>${r.sidecar.totalDetections}</td></tr>
+      <tr><td>browser (per tab)</td><td>${r.browser.capacityFps.toFixed(1)}</td><td>${r.browser.totalDetections}</td></tr>
+      <tr><td>sidecar (per stream)</td><td>${r.sidecar.capacityFps.toFixed(1)}</td><td>${r.sidecar.totalDetections}</td></tr>
     </table>
+    <div class="bench-note">
+      Single-stream figures. The browser number is per pilot tab (each pilot
+      only runs the drones they're watching). The sidecar's production capacity
+      is its parallel fan-out (~20 streams @ 1 Hz), measured by
+      scripts/benchmark_concurrent_streams.py — not this single-stream number.
+    </div>
     <div class="bench-section">detection agreement (browser vs sidecar)</div>
     <table>
       <tr><th>frames presence-agree</th><th>box match rate</th><th>matched</th><th>browser-only</th><th>sidecar-only</th><th>mean IoU</th><th>mean |Δconf|</th></tr>
