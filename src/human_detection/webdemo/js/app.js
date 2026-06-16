@@ -6,6 +6,7 @@
 
 const els = {
   epPill: document.getElementById("ep-pill"),
+  webnnPill: document.getElementById("webnn-pill"),
   sidecarPill: document.getElementById("sidecar-pill"),
   statEp: document.getElementById("stat-ep"),
   statModel: document.getElementById("stat-model"),
@@ -170,6 +171,7 @@ function initWorker() {
       for (const tile of STATE.tiles) tile.inflight = false;
     }
     setPill(els.epPill, "pending", "loading model…");
+    setPill(els.webnnPill, "pending", "WebNN …");
     els.bootError.hidden = true;
 
     const worker = new Worker("/webdemo/js/detector-worker.js", { type: "module" });
@@ -185,6 +187,7 @@ function initWorker() {
         const epLabel =
           msg.ep + (msg.ep === "wasm" ? ` ×${msg.numThreads}` : "");
         setPill(els.epPill, msg.ep === "wasm" ? "warn" : "ok", epLabel);
+        updateWebnnPill(msg);
         els.statEp.textContent =
           msg.ep + (msg.epDetail ? ` (${msg.epDetail})` : "") + ` · ort:${msg.ortSource}`;
         els.statModel.textContent = `${msg.modelFile} (${msg.precision})`;
@@ -1348,6 +1351,36 @@ function wireControls() {
 function setPill(el, state, text) {
   el.className = `state-pill state-${state === "pending" ? "pending" : state}`;
   el.textContent = text;
+}
+
+// Dedicated, unmistakable WebNN status. Three states:
+//   active     -> green  "WebNN ✓ on"          (fast path is live)
+//   available  -> amber  "WebNN ◦ idle (webgpu)" (browser supports it, but
+//                                                  another EP is selected)
+//   off        -> red    "WebNN ✕ off (webgpu)" (browser can't expose it)
+function updateWebnnPill(msg) {
+  const el = els.webnnPill;
+  if (!el) return;
+  if (msg.ep === "webnn") {
+    setPill(el, "ok", "WebNN \u2713 on");
+    el.title =
+      "WebNN is active — hardware-accelerated inference (~3-4x faster than WebGPU on this machine).";
+    return;
+  }
+  const available = "ml" in self.navigator;
+  if (available) {
+    setPill(el, "warn", `WebNN \u25e6 idle (${msg.ep})`);
+    el.title =
+      `WebNN is supported by this browser but the '${msg.ep}' backend is currently selected.` +
+      " Switch the backend control to 'webnn' (or 'auto') for the fastest path.";
+  } else {
+    setPill(el, "bad", `WebNN \u2717 off (${msg.ep})`);
+    el.title =
+      "WebNN is not enabled in this browser, so the page is running on the slower " +
+      `'${msg.ep}' backend (no setup needed, just slower). To enable WebNN, relaunch ` +
+      "Chrome with --enable-features=WebMachineLearningNeuralNetwork, or enable " +
+      "chrome://flags/#web-machine-learning-neural-network.";
+  }
 }
 
 function sleep(ms) {
