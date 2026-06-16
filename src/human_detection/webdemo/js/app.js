@@ -7,6 +7,9 @@
 const els = {
   epPill: document.getElementById("ep-pill"),
   webnnPill: document.getElementById("webnn-pill"),
+  webnnHelp: document.getElementById("webnn-help"),
+  webnnHelpClose: document.getElementById("webnn-help-close"),
+  webnnHelpLead: document.getElementById("webnn-help-lead"),
   sidecarPill: document.getElementById("sidecar-pill"),
   statEp: document.getElementById("stat-ep"),
   statModel: document.getElementById("stat-model"),
@@ -1302,6 +1305,7 @@ function renderBenchResults(r) {
 // ---------------------------------------------------------------------------
 
 function wireControls() {
+  wireWebnnHelp();
   els.ctlEp.addEventListener("change", () => initWorker().catch(() => {}));
   els.ctlPrecision.addEventListener("change", () => initWorker().catch(() => {}));
   els.ctlSource.addEventListener("change", async () => {
@@ -1365,6 +1369,7 @@ function updateWebnnPill(msg) {
     setPill(el, "ok", "WebNN \u2713 on");
     el.title =
       "WebNN is active — hardware-accelerated inference (~3-4x faster than WebGPU on this machine).";
+    hideWebnnHelp();
     return;
   }
   const available = "ml" in self.navigator;
@@ -1373,13 +1378,104 @@ function updateWebnnPill(msg) {
     el.title =
       `WebNN is supported by this browser but the '${msg.ep}' backend is currently selected.` +
       " Switch the backend control to 'webnn' (or 'auto') for the fastest path.";
+    hideWebnnHelp();
   } else {
     setPill(el, "bad", `WebNN \u2717 off (${msg.ep})`);
     el.title =
       "WebNN is not enabled in this browser, so the page is running on the slower " +
-      `'${msg.ep}' backend (no setup needed, just slower). To enable WebNN, relaunch ` +
-      "Chrome with --enable-features=WebMachineLearningNeuralNetwork, or enable " +
-      "chrome://flags/#web-machine-learning-neural-network.";
+      `'${msg.ep}' backend. Click for instructions to relaunch Chrome with WebNN enabled.`;
+    // Auto-open the help panel the first time per session; the user can dismiss
+    // it and reopen any time by clicking the red badge.
+    if (!sessionStorage.getItem("webnn.help.dismissed")) showWebnnHelp();
+  }
+}
+
+const DISMISS_KEY = "webnn.help.dismissed";
+
+function detectOs() {
+  const ua = self.navigator.userAgent || "";
+  const plat =
+    (self.navigator.userAgentData && self.navigator.userAgentData.platform) ||
+    self.navigator.platform ||
+    "";
+  const s = `${plat} ${ua}`;
+  if (/Mac|iPhone|iPad/i.test(s)) return "mac";
+  if (/Win/i.test(s)) return "win";
+  if (/Linux|X11|CrOS/i.test(s)) return "linux";
+  return "other";
+}
+
+function isChromium() {
+  const ua = self.navigator.userAgent || "";
+  if (self.navigator.userAgentData && Array.isArray(self.navigator.userAgentData.brands)) {
+    return self.navigator.userAgentData.brands.some((b) => /Chromium|Google Chrome|Microsoft Edge/i.test(b.brand));
+  }
+  return /Chrome|Chromium|CriOS|Edg/i.test(ua) && !/Firefox|FxiOS/i.test(ua);
+}
+
+function showWebnnHelp() {
+  const el = els.webnnHelp;
+  if (!el) return;
+  // Highlight the command for the detected OS; de-emphasise the others.
+  const os = detectOs();
+  el.querySelectorAll(".webnn-cmd").forEach((c) => {
+    c.classList.toggle("webnn-cmd-active", c.getAttribute("data-os") === os);
+  });
+  if (els.webnnHelpLead && !isChromium()) {
+    els.webnnHelpLead.innerHTML =
+      "WebNN only runs on <strong>Chromium browsers</strong> (Google Chrome or Microsoft Edge). " +
+      "Open this page in Chrome, then enable WebNN with the command below.";
+  }
+  el.hidden = false;
+}
+
+function hideWebnnHelp() {
+  if (els.webnnHelp) els.webnnHelp.hidden = true;
+}
+
+function wireWebnnHelp() {
+  if (els.webnnHelpClose) {
+    els.webnnHelpClose.addEventListener("click", () => {
+      hideWebnnHelp();
+      try {
+        sessionStorage.setItem(DISMISS_KEY, "1");
+      } catch {
+        /* private mode */
+      }
+    });
+  }
+  // Clicking the red WebNN badge reopens the instructions (even after dismiss).
+  if (els.webnnPill) {
+    els.webnnPill.addEventListener("click", () => {
+      if (els.webnnPill.classList.contains("state-bad")) showWebnnHelp();
+    });
+    els.webnnPill.style.cursor = "pointer";
+  }
+  if (els.webnnHelp) {
+    els.webnnHelp.querySelectorAll(".copy-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const code = document.getElementById(btn.getAttribute("data-target"));
+        if (!code) return;
+        const text = code.textContent || "";
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch {
+          // Fallback: select the text so the user can copy manually.
+          const range = document.createRange();
+          range.selectNodeContents(code);
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+        const prev = btn.textContent;
+        btn.textContent = "copied \u2713";
+        btn.classList.add("copied");
+        setTimeout(() => {
+          btn.textContent = prev;
+          btn.classList.remove("copied");
+        }, 1500);
+      });
+    });
   }
 }
 

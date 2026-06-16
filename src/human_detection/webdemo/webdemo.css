@@ -186,6 +186,87 @@ h1 {
   font-family: ui-monospace, Menlo, monospace;
 }
 
+.webnn-help {
+  position: relative;
+  margin-top: 10px;
+  background: #1a1407;
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  padding: 12px 14px;
+  color: #fde9c4;
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 760px;
+}
+.webnn-help-title {
+  font-weight: 700;
+  color: var(--warn);
+  margin-bottom: 6px;
+}
+.webnn-help-lead { margin: 0 0 10px; }
+.webnn-help-foot { margin: 10px 0 0; color: var(--muted); font-size: 12.5px; }
+.webnn-help-foot code {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-family: ui-monospace, Menlo, monospace;
+}
+.webnn-help-close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+.webnn-help-close:hover { color: #fff; }
+
+.webnn-cmd {
+  margin: 8px 0;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  overflow: hidden;
+  opacity: 0.55;
+}
+.webnn-cmd.webnn-cmd-active {
+  opacity: 1;
+  border-color: var(--accent-2);
+}
+.webnn-cmd-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: rgba(255, 255, 255, 0.05);
+  padding: 4px 10px;
+}
+.webnn-os { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+.webnn-cmd.webnn-cmd-active .webnn-os { color: var(--accent-2); }
+.webnn-cmd code {
+  display: block;
+  padding: 8px 10px;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 12.5px;
+  color: #e6edff;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.copy-btn {
+  background: var(--accent-2);
+  color: #04222e;
+  border: none;
+  border-radius: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.copy-btn:hover { filter: brightness(1.1); }
+.copy-btn.copied { background: var(--accent); }
+
 main#grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));

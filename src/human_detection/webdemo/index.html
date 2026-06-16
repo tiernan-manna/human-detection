@@ -159,6 +159,49 @@
 
     <div id="bench-results" class="bench-results" hidden></div>
     <div id="boot-error" class="boot-error" hidden></div>
+
+    <div id="webnn-help" class="webnn-help" hidden>
+      <button id="webnn-help-close" class="webnn-help-close" type="button" title="Dismiss">&times;</button>
+      <div class="webnn-help-title">⚡ WebNN is off — running on the slower WebGPU backend</div>
+      <p class="webnn-help-lead" id="webnn-help-lead">
+        WebNN runs roughly <strong>3–4× faster</strong> on this machine. It's a Chrome
+        feature that has to be switched on when Chrome starts — the page still works
+        without it, this is purely a speed upgrade.
+        <strong>Fully quit Chrome first</strong> (Cmd-Q / close every window), then run
+        the command for your system and reopen this page:
+      </p>
+
+      <div class="webnn-cmd" data-os="mac">
+        <div class="webnn-cmd-head">
+          <span class="webnn-os">macOS</span>
+          <button class="copy-btn" type="button" data-target="cmd-mac">copy</button>
+        </div>
+        <code id="cmd-mac">open -na "Google Chrome" --args --enable-features=WebMachineLearningNeuralNetwork</code>
+      </div>
+
+      <div class="webnn-cmd" data-os="win">
+        <div class="webnn-cmd-head">
+          <span class="webnn-os">Windows (PowerShell)</span>
+          <button class="copy-btn" type="button" data-target="cmd-win">copy</button>
+        </div>
+        <code id="cmd-win">&amp; "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" --enable-features=WebMachineLearningNeuralNetwork</code>
+      </div>
+
+      <div class="webnn-cmd" data-os="linux">
+        <div class="webnn-cmd-head">
+          <span class="webnn-os">Linux</span>
+          <button class="copy-btn" type="button" data-target="cmd-linux">copy</button>
+        </div>
+        <code id="cmd-linux">google-chrome --enable-features=WebMachineLearningNeuralNetwork</code>
+      </div>
+
+      <p class="webnn-help-foot">
+        Prefer clicking? Open <code>chrome://flags/#web-machine-learning-neural-network</code>,
+        set it to <strong>Enabled</strong>, and relaunch. Reload this page afterwards — the
+        badge turns green when WebNN is active. (Not on Chrome/Edge? WebNN only works on
+        Chromium browsers today.)
+      </p>
+    </div>
   </header>
 
   <main id="grid"></main>
