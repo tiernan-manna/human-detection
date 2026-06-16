@@ -480,6 +480,9 @@ Key files:
 - [`scripts/run_sidecar.py`](scripts/run_sidecar.py) — sidecar entry point.
 - [`src/human_detection/demo/`](src/human_detection/demo/) — browser demo page
   (HTML/JS/CSS) served at `/demo`.
+- [`src/human_detection/webdemo/`](src/human_detection/webdemo/) — in-browser
+  inference demo (onnxruntime-web + JS pipeline port) served at `/webdemo`;
+  see [`docs/webdemo.md`](docs/webdemo.md).
 
 ## Demo page
 
@@ -500,7 +503,9 @@ is running, open that URL in any modern browser. The page:
 
 Controls: change the tile count (1-30), rate (0.2-5 Hz), toggle
 `low-light mode` to exercise the reduced-confidence code path, hide
-labels, pause the send loop, or reset the rolling stats.
+labels, pause the send loop, or reset the rolling stats. In recording
+mode every tile has a timeline scrub bar — drag to seek (display-only
+while dragging), release and detection resumes from there.
 
 Notes:
 
@@ -516,6 +521,28 @@ Notes:
   kernels to compile — subsequent inferences are ~80-100 ms. This
   means a freshly-started sidecar will show 0 det on all tiles for the
   first ~30 s; after that boxes appear live.
+
+## In-browser demo (`/webdemo`)
+
+A second demo at [`http://127.0.0.1:8765/webdemo`](http://127.0.0.1:8765/webdemo)
+runs the **whole pipeline in the browser** — ONNX WALDO v3 via
+onnxruntime-web (WebNN → WebGPU → WASM) plus a JS port of all
+post-processing (crosshair inpaint, decode+NMS, ByteTrack, the full gate
+stack). The local sidecar only serves static assets and recordings, and
+acts as the reference pipeline for the built-in live compare overlay and
+browser-vs-local benchmark.
+
+One-time setup, then open the URL:
+
+```bash
+.venv/bin/python scripts/export_web_model.py --fetch-ort
+```
+
+Verified at accuracy parity with the local pipeline (exact post-processing
+match on 240/240 harness frames; 100% detection agreement on a 400-frame
+paced replay) and ~25-40% *faster* than the Python sidecar on Apple Silicon
+when Chrome's WebNN flag is enabled. Full architecture, parity methodology
+and benchmark results: [`docs/webdemo.md`](docs/webdemo.md).
 
 ## Recording & replay
 

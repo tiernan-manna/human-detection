@@ -1,0 +1,6 @@
+{
+  "name": "human-detection-webdemo",
+  "private": true,
+  "type": "module",
+  "description": "Marks the webdemo JS as ES modules so Node (parity harness) and the browser agree. Not an npm package; no dependencies."
+}

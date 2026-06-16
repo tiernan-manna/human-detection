@@ -86,6 +86,7 @@ log = logging.getLogger(__name__)
 HEADER_LEN_STRUCT = struct.Struct("<I")
 
 _DEMO_DIR = Path(__file__).parent / "demo"
+_WEBDEMO_DIR = Path(__file__).parent / "webdemo"
 # Images that the browser can actually decode. Anything else in sample_images/
 # (eg .avif) is skipped from the demo index.
 _DEMO_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -257,6 +258,13 @@ def create_app(
     # Always mounted — the sidecar is localhost-only, so this is safe; users
     # who don't want it can just not open localhost:8765/demo.
     _register_demo_routes(app, effective_config)
+
+    # --- In-browser demo (/webdemo) ------------------------------------------
+    # Runs the WHOLE pipeline client-side (onnxruntime-web: WebNN/WebGPU/WASM
+    # + a JS port of the post-processing). The sidecar only serves static
+    # assets, recordings, and acts as the reference pipeline for the
+    # compare overlay / benchmark.
+    _register_webdemo_routes(app)
 
     return app
 
@@ -734,6 +742,124 @@ def _register_demo_routes(app: FastAPI, config: Config) -> None:
             raise HTTPException(status_code=404, detail="not an image")
         mime, _ = mimetypes.guess_type(target.name)
         return FileResponse(target, media_type=mime or "application/octet-stream")
+
+
+def _register_webdemo_routes(app: FastAPI) -> None:
+    """Mount the in-browser demo: static page + JS modules, the exported
+    ONNX models, the vendored onnxruntime-web dist, and a small endpoint
+    to persist benchmark reports next to the repo's other bench artifacts.
+
+    COOP/COEP headers make the page crossOriginIsolated so the WASM
+    fallback can use threads. All subresources are same-origin (or the
+    jsdelivr CDN fallback, which serves CORP: cross-origin), so
+    require-corp doesn't break anything.
+    """
+
+    _ISOLATE = {
+        "Cache-Control": "no-store, must-revalidate",
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+    }
+    # Exported model files: resolved relative to CWD like recordings_dir —
+    # the sidecar is started from the repo root, where scripts/
+    # export_web_model.py writes models/web/.
+    web_model_dir = Path.cwd() / "models" / "web"
+    bench_out_dir = Path.cwd() / "outputs" / "bench"
+
+    @app.get("/webdemo", include_in_schema=False)
+    async def webdemo_index() -> FileResponse:
+        path = _WEBDEMO_DIR / "index.html"
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="webdemo/index.html missing")
+        return FileResponse(path, media_type="text/html", headers=_ISOLATE)
+
+    @app.get("/webdemo/webdemo.css", include_in_schema=False)
+    async def webdemo_css() -> FileResponse:
+        path = _WEBDEMO_DIR / "webdemo.css"
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="webdemo.css missing")
+        return FileResponse(path, media_type="text/css", headers=_ISOLATE)
+
+    @app.get("/webdemo/js/{name}", include_in_schema=False)
+    async def webdemo_js(name: str) -> FileResponse:
+        if not _is_safe_leaf(name) or not name.endswith(".js"):
+            raise HTTPException(status_code=400, detail="invalid name")
+        path = _WEBDEMO_DIR / "js" / name
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="not found")
+        return FileResponse(
+            path, media_type="text/javascript", headers=_ISOLATE
+        )
+
+    @app.get("/webdemo/model/{name}", include_in_schema=False)
+    async def webdemo_model(name: str) -> FileResponse:
+        if not _is_safe_leaf(name):
+            raise HTTPException(status_code=400, detail="invalid name")
+        path = web_model_dir / name
+        if not path.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"{name} missing — run: "
+                    ".venv/bin/python scripts/export_web_model.py --fetch-ort"
+                ),
+            )
+        if name.endswith(".json"):
+            return FileResponse(path, media_type="application/json", headers=_ISOLATE)
+        if not name.endswith(".onnx"):
+            raise HTTPException(status_code=400, detail="not a model file")
+        # ONNX exports only change when re-exported; let the browser cache
+        # them so EP switches (which recreate the worker) don't re-download
+        # ~12 MB each time.
+        return FileResponse(
+            path,
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "public, max-age=3600",
+                "Cross-Origin-Embedder-Policy": "require-corp",
+            },
+        )
+
+    @app.get("/webdemo/ort/{name}", include_in_schema=False)
+    async def webdemo_ort(name: str) -> FileResponse:
+        if not _is_safe_leaf(name):
+            raise HTTPException(status_code=400, detail="invalid name")
+        ext = name.rsplit(".", 1)[-1].lower()
+        if ext not in {"mjs", "wasm", "map"}:
+            raise HTTPException(status_code=400, detail="not an ort dist file")
+        path = web_model_dir / "ort" / name
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="not found")
+        media = {
+            "mjs": "text/javascript",
+            "wasm": "application/wasm",
+            "map": "application/json",
+        }[ext]
+        # ort-web spawns nested workers from these .mjs files. Under the
+        # page's COEP: require-corp, a worker script's response must itself
+        # carry COEP, otherwise Chrome blocks it (ERR_BLOCKED_BY_RESPONSE).
+        return FileResponse(
+            path,
+            media_type=media,
+            headers={
+                "Cache-Control": "public, max-age=3600",
+                "Cross-Origin-Embedder-Policy": "require-corp",
+                "Cross-Origin-Resource-Policy": "same-origin",
+            },
+        )
+
+    @app.post("/webdemo/bench", include_in_schema=False)
+    async def webdemo_bench_save(report: dict = Body(...)) -> dict:
+        """Persist a benchmark report from the webdemo page so runs are
+        comparable over time alongside outputs/bench/'s other artifacts."""
+        if report.get("kind") != "webdemo-benchmark":
+            raise HTTPException(status_code=400, detail="not a webdemo benchmark")
+        bench_out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = bench_out_dir / f"webdemo-bench-{stamp}.json"
+        path.write_text(json.dumps(report, indent=2) + "\n")
+        rel = path.relative_to(Path.cwd()) if path.is_relative_to(Path.cwd()) else path
+        return {"saved": str(rel)}
 
 
 def _resolve_session_dir(recorder: Recorder, name: str) -> Path:
