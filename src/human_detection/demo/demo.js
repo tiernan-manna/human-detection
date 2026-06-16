@@ -1173,6 +1173,11 @@
         <canvas></canvas>
         <button type="button" class="tile-expand-btn" title="Expand this tile to fill the row for a closer look at the recording. Click again (or press Esc) to collapse back into the grid." aria-label="Expand tile"><span class="tile-expand-btn__glyph" aria-hidden="true">&#x2922;</span><span class="tile-expand-btn__label">Expand</span></button>
       </div>
+      <div class="tile-scrub">
+        <input type="range" class="scrub-range" min="0" max="${Math.max(0, playlist.length - 1)}" step="1" value="0"
+               title="Scrub this tile's recording. Drag to seek (display only); detection resumes from the new position on release." />
+        <span class="scrub-pos">1/${playlist.length}</span>
+      </div>
       <div class="tile-footer">
         <span class="tile-name">${escapeHtml(uavId)}</span>
         <span class="tile-meta">
@@ -1209,7 +1214,7 @@
       nameEl.textContent = `${uavId} ← ${shortenSession(source.recordingName)}/${source.uavId}`;
       nameEl.title = `${uavId} replaying ${source.recordingName} stream ${source.uavId}`;
     }
-    return {
+    const tile = {
       kind: "replay",
       uavId,
       el,
@@ -1217,6 +1222,12 @@
       canvas,
       ms: el.querySelector(".ms"),
       dets: el.querySelector(".dets"),
+      scrubRange: el.querySelector(".scrub-range"),
+      scrubPos: el.querySelector(".scrub-pos"),
+      // True while the operator is dragging the timeline. Pauses this
+      // tile's sends (display-only seeking) without touching the global
+      // pause state or the other tiles.
+      _scrubbing: false,
       // Manifest the frame indices belong to; each tile carries this
       // explicitly so different tiles can be replaying different
       // recordings in "all" mode without sharing a global cursor.
@@ -1246,6 +1257,34 @@
       // and FIFO bookkeeping stay coherent.
       _sending: false,
     };
+
+    // Timeline scrubbing: drag = display-only seek; replay (and
+    // detection) resumes from the released position on the next tick.
+    const scrub = tile.scrubRange;
+    if (scrub) {
+      scrub.addEventListener("pointerdown", (ev) => {
+        // Same reason as the expand button: don't let the labelling
+        // overlay interpret a scrub as the start of a bbox draw.
+        ev.stopPropagation();
+        tile._scrubbing = true;
+      });
+      scrub.addEventListener("input", () => {
+        const idx = Math.min(
+          tile.playlist.length - 1,
+          Math.max(0, parseInt(scrub.value, 10) || 0)
+        );
+        tile.cursor = idx;
+        displayReplayFrame(tile, idx);
+      });
+      const release = () => {
+        tile._scrubbing = false;
+      };
+      scrub.addEventListener("pointerup", release);
+      scrub.addEventListener("pointercancel", release);
+      // Keyboard seeks (arrow keys) fire `change` without pointer events.
+      scrub.addEventListener("change", release);
+    }
+    return tile;
   }
 
   // Store one observation of "did the current detector see anyone in
@@ -1272,8 +1311,61 @@
     }
   }
 
+  // Move a replay tile's visible playhead to playlist index `idx`:
+  // update the <img>, canvas geometry, seq bookkeeping, timeline slider,
+  // and clear stale overlays. Shared by the send loop (auto-advance) and
+  // the timeline scrubber (manual seek). Returns the frame, or null.
+  function displayReplayFrame(tile, idx) {
+    const frame = tile.manifest.frames[tile.playlist[idx]];
+    if (!frame) return null;
+    if (!tile.img.src.endsWith(frame.jpegUrl)) {
+      tile.img.src = frame.jpegUrl;
+      tile.currentSeq = frame.seq;
+      // If the user is mid-hold in presence mode, the playhead just
+      // moved to a new frame underneath them — that's the entire
+      // point of "click and hold while a person is visible". Emit a
+      // label for the freshly-advanced frame from the label module's
+      // event hook (no-op when labelling isn't active).
+      if (typeof onReplayTileFrameAdvanced === "function") {
+        onReplayTileFrameAdvanced(tile, frame.seq);
+      }
+      if (
+        frame.imgW &&
+        frame.imgH &&
+        (tile.canvas.width !== frame.imgW ||
+          tile.canvas.height !== frame.imgH)
+      ) {
+        tile.canvas.width = frame.imgW;
+        tile.canvas.height = frame.imgH;
+        const media = tile.el.querySelector(".tile-media");
+        if (media) media.style.aspectRatio = `${frame.imgW} / ${frame.imgH}`;
+      }
+      // Box overlays from the previous frame are stale as soon as we
+      // advance the playhead. Also drop the velocity history — the
+      // playhead jump can be back to seq 1 on a replay loop, where
+      // the same trackId may now refer to a person standing somewhere
+      // completely different. Carrying the old velocity forward
+      // would whip the box across the frame on the next update.
+      tile.detections = [];
+      tile.rawDetections = [];
+      tile.lastDetectionsAt = 0;
+      if (tile.trackHistory) tile.trackHistory.clear();
+      drawBoxes(tile);
+    }
+    if (tile.scrubRange && !tile._scrubbing) {
+      tile.scrubRange.value = String(idx);
+    }
+    if (tile.scrubPos) {
+      tile.scrubPos.textContent = `${idx + 1}/${tile.playlist.length}`;
+    }
+    return frame;
+  }
+
   async function sendReplayTile(tile) {
     if (!STATE.ws || STATE.ws.readyState !== WebSocket.OPEN) return;
+    // Display-only seeking: while the operator drags the timeline we
+    // don't send anything — detection resumes from the released spot.
+    if (tile._scrubbing) return;
     // Re-entrancy guard: the very first time a tile reaches a frame
     // we have to await the HTTP fetch for the JPEG, which can easily
     // outlast one setInterval tick (especially at 10–30 Hz). Without
@@ -1283,48 +1375,8 @@
     if (tile._sending) return;
     tile._sending = true;
     try {
-      const frame = tile.manifest.frames[tile.playlist[tile.cursor]];
+      const frame = displayReplayFrame(tile, tile.cursor);
       if (!frame) return;
-
-      // Always keep the visible thumbnail in sync, regardless of
-      // whether the WS payload made it out this tick. This is what
-      // makes the tiles look like videos playing — without it the user
-      // would only see motion once preload caught up to a tile's
-      // cursor, which on a big recording could be seconds.
-      if (!tile.img.src.endsWith(frame.jpegUrl)) {
-        tile.img.src = frame.jpegUrl;
-        tile.currentSeq = frame.seq;
-        // If the user is mid-hold in presence mode, the playhead just
-        // moved to a new frame underneath them — that's the entire
-        // point of "click and hold while a person is visible". Emit a
-        // label for the freshly-advanced frame from the label module's
-        // event hook (no-op when labelling isn't active).
-        if (typeof onReplayTileFrameAdvanced === "function") {
-          onReplayTileFrameAdvanced(tile, frame.seq);
-        }
-        if (
-          frame.imgW &&
-          frame.imgH &&
-          (tile.canvas.width !== frame.imgW ||
-            tile.canvas.height !== frame.imgH)
-        ) {
-          tile.canvas.width = frame.imgW;
-          tile.canvas.height = frame.imgH;
-          const media = tile.el.querySelector(".tile-media");
-          if (media) media.style.aspectRatio = `${frame.imgW} / ${frame.imgH}`;
-        }
-        // Box overlays from the previous frame are stale as soon as we
-        // advance the playhead. Also drop the velocity history — the
-        // playhead jump can be back to seq 1 on a replay loop, where
-        // the same trackId may now refer to a person standing somewhere
-        // completely different. Carrying the old velocity forward
-        // would whip the box across the frame on the next update.
-        tile.detections = [];
-        tile.rawDetections = [];
-        tile.lastDetectionsAt = 0;
-        if (tile.trackHistory) tile.trackHistory.clear();
-        drawBoxes(tile);
-      }
 
       // FAST PATH: ask the sidecar to load the JPEG directly from
       // disk. Replay tiles only ever play frames that already live in

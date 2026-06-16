@@ -446,6 +446,48 @@ body.is-label-mode-off .ctl-label-submode {
   display: none;
 }
 
+/* Replay timeline scrubber (replay tiles only). */
+.tile-scrub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-top: 1px solid var(--border);
+}
+.tile-scrub .scrub-range {
+  flex: 1;
+  height: 4px;
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+.tile-scrub .scrub-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+}
+.tile-scrub .scrub-range::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+}
+.tile-scrub .scrub-pos {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  min-width: 64px;
+  text-align: right;
+}
+
 .tile-footer {
   display: flex;
   justify-content: space-between;
