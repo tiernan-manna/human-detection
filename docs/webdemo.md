@@ -36,14 +36,33 @@ page (`app.js`) only does replay pacing, drawing, and stats.
 
 Backend notes:
 
-- **WebNN** (fastest on Apple Silicon, uses CoreML/GPU via Chrome) needs
-  Chrome launched with
-  `--enable-features=WebMachineLearningNeuralNetwork`.
-- **WebGPU** works in stock Chrome/Edge (and is the path Safari/Firefox
-  will eventually take).
+- **WebGPU** is the real-world default: it's enabled out of the box in stable
+  Chrome/Edge, so opening the page gives accelerated inference with **zero
+  setup** (no flags, no terminal). On Apple Silicon expect ~165 ms/frame
+  (fp32 dynamic), i.e. ~6 streams/tab when warm. This is the path stock pilot
+  machines actually use.
+- **WebNN** is ~3× faster (~53 ms warm on Apple Silicon, CoreML/ANE) but is
+  **not shipping unflagged in stable Chrome**. There are exactly two ways to
+  get it without each user editing `chrome://flags`:
+  1. **Origin Trial token** — register the deploy origin at
+     <https://developer.chrome.com/origintrials> and drop the token into the
+     `origin-trial` `<meta>` in `index.html`; every visitor then gets WebNN
+     automatically. The trial has been repeatedly disabled upstream (next
+     planned window ~M149–151), so treat it as opportunistic, not guaranteed.
+  2. **Chrome Enterprise policy** — if pilot laptops are MDM-managed, IT can
+     enable the WebNN feature fleet-wide once, with no per-user action.
+  Until one of those is in place the worker silently falls through to WebGPU.
+  (Launching Chrome with `--enable-features=WebMachineLearningNeuralNetwork`
+  is for local testing only — never something a pilot should have to do.)
 - **WASM** always works; the sidecar serves `/webdemo` with COOP/COEP
   headers so the page is `crossOriginIsolated` and the WASM fallback gets
   multi-threading.
+
+> **fp16 is not a speed win here.** The fp16 export is locked to a static
+> 640×640 shape, so on WebGPU it runs *slower* (~197 ms) than the fp32 dynamic
+> model at ~640×480 (~165 ms). Keep fp32 as the default. The only lever that
+> meaningfully cuts WebGPU latency is a smaller-input model — an accuracy
+> tradeoff that should ride on a re-export + parity check, not a config toggle.
 
 The `backend` and `precision` selectors reload the model live. `fp32` is
 the accuracy-parity default (dynamic input shapes, letterboxed exactly like
@@ -196,7 +215,9 @@ Repro: `outputs/bench/webdemo-bench-*.json` hold the raw reports;
 - **SAHI is not ported** — the webdemo always runs single-pass inference
   (`detector_kind=waldo` equivalent). Per the feasibility doc, SAHI's
   contribution at drone altitudes is marginal; revisit if that changes.
-- **WebNN needs a Chrome flag** until the API ships by default.
+- **WebNN is not available flagless in stable Chrome yet** — see the backend
+  notes above for the Origin Trial / enterprise-policy paths. Stock browsers
+  transparently fall back to WebGPU, which needs no setup.
 - Browser JPEG decoding differs from OpenCV's at the pixel level, so boxes
   can differ by ~1px vs the local pipeline (confidences by <0.01). All
   observed gate decisions are unaffected.

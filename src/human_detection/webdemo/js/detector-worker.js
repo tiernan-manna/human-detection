@@ -147,7 +147,11 @@ async function handleInit(opts) {
   const errors = [];
   for (const ep of epChain) {
     if (ep === "webnn" && !("ml" in self.navigator)) {
-      errors.push("webnn: navigator.ml unavailable (launch Chrome with --enable-features=WebMachineLearningNeuralNetwork)");
+      // WebNN isn't shipping unflagged in stable Chrome yet (the Origin Trial
+      // that would expose it to all visitors keeps getting disabled upstream).
+      // This is expected on stock browsers — we silently fall through to WebGPU,
+      // which is on by default and needs no setup.
+      errors.push("webnn: navigator.ml unavailable (not enabled in this browser) — using WebGPU");
       continue;
     }
     if (ep === "webgpu" && !("gpu" in self.navigator)) {
