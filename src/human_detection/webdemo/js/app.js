@@ -1366,9 +1366,15 @@ function updateWebnnPill(msg) {
   const el = els.webnnPill;
   if (!el) return;
   if (msg.ep === "webnn") {
-    setPill(el, "ok", "WebNN \u2713 on");
+    const dev = /deviceType=(\w+)/.exec(msg.epDetail || "");
+    const devName = dev ? dev[1] : "";
+    setPill(el, "ok", `WebNN \u2713 on${devName ? ` (${devName})` : ""}`);
     el.title =
-      "WebNN is active — hardware-accelerated inference (~3-4x faster than WebGPU on this machine).";
+      `WebNN is active on the ${devName || "accelerator"} — hardware-accelerated inference` +
+      " (~3-4x faster than WebGPU on this machine)." +
+      (devName === "npu"
+        ? " Running on the dedicated NPU."
+        : " (NPU was unavailable or unsupported for this model, so it's on the GPU.)");
     hideWebnnHelp();
     return;
   }

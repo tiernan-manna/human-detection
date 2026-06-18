@@ -145,7 +145,7 @@ async function handleInit(opts) {
   // Probe with a session at the default 640x640 shape; the same EP options
   // are reused for per-shape sessions later.
   const errors = [];
-  for (const ep of epChain) {
+  probe: for (const ep of epChain) {
     if (ep === "webnn" && !("ml" in self.navigator)) {
       // WebNN isn't shipping unflagged in stable Chrome yet (the Origin Trial
       // that would expose it to all visitors keeps getting disabled upstream).
@@ -158,14 +158,31 @@ async function handleInit(opts) {
       errors.push("webgpu: navigator.gpu unavailable");
       continue;
     }
+    // WebNN: try both the NPU and the GPU, TIME each, and keep the faster one.
+    // A plain NPU-first/error-fallback is wrong because the NPU often *runs*
+    // (so it doesn't error) but is much slower than the GPU for an fp32 graph
+    // (the ANE wants fp16). Timing self-selects per machine: the NPU wins on
+    // hardware where it's genuinely faster (some Windows/Qualcomm NPUs), the
+    // GPU wins on Apple Silicon with fp32.
+    if (ep === "webnn") {
+      const pick = await pickWebnnDevice(errors);
+      if (!pick) continue;
+      sessions.clear();
+      sessionEpOptions = epOptionsFor("webnn", pick.v);
+      const s = await createSession(640, 640);
+      await warmup(s, 640, 640);
+      activeEp = "webnn";
+      epDetail = `deviceType=${pick.v.deviceType}`;
+      break probe;
+    }
+
     try {
       sessionEpOptions = epOptionsFor(ep);
-      const probe = await createSession(640, 640);
+      const probeSession = await createSession(640, 640);
+      await warmup(probeSession, 640, 640);
       activeEp = ep;
-      epDetail = ep === "webnn" ? "deviceType=gpu" : "";
-      // Warm up (model load + shader/JIT compile) on the probe session.
-      await warmup(probe, 640, 640);
-      break;
+      epDetail = "";
+      break probe;
     } catch (err) {
       errors.push(`${ep}: ${truncate(String(err), 300)}`);
       sessions.clear();
@@ -191,9 +208,15 @@ async function handleInit(opts) {
   });
 }
 
-function epOptionsFor(ep) {
+function epOptionsFor(ep, variant) {
   if (ep === "webnn") {
-    return [{ name: "webnn", deviceType: "gpu", powerPreference: "default" }];
+    return [
+      {
+        name: "webnn",
+        deviceType: (variant && variant.deviceType) || "gpu",
+        powerPreference: "default",
+      },
+    ];
   }
   if (ep === "webgpu") {
     return [{ name: "webgpu", preferredLayout: "NCHW" }];
@@ -263,6 +286,50 @@ async function runDummy(session, outH, outW) {
 
 async function warmup(entry, outH, outW, rounds = 3) {
   for (let i = 0; i < rounds; i++) await runDummy(entry.session, outH, outW);
+}
+
+// Median steady-state run time (ms) for a session, after warm-up.
+async function timeRuns(entry, outH, outW, rounds = 3) {
+  const times = [];
+  for (let i = 0; i < rounds; i++) {
+    const t0 = performance.now();
+    await runDummy(entry.session, outH, outW);
+    times.push(performance.now() - t0);
+  }
+  times.sort((a, b) => a - b);
+  return times[Math.floor(times.length / 2)];
+}
+
+// Probe each WebNN device type, time it warm, and return the fastest that works
+// ({ v, ms }) — or null if none initialise. Sessions are released between probes
+// so the per-shape cache only ever holds the device we ultimately commit to.
+async function pickWebnnDevice(errors) {
+  const candidates = [{ deviceType: "npu" }, { deviceType: "gpu" }];
+  let best = null;
+  for (const v of candidates) {
+    try {
+      sessions.clear();
+      sessionEpOptions = epOptionsFor("webnn", v);
+      const s = await createSession(640, 640);
+      await warmup(s, 640, 640, 2);
+      const ms = await timeRuns(s, 640, 640, 3);
+      errors.push(`webnn:${v.deviceType}: ok (~${ms.toFixed(0)} ms/frame warm)`);
+      if (!best || ms < best.ms) best = { v, ms };
+    } catch (err) {
+      errors.push(`webnn:${v.deviceType}: ${truncate(String(err), 200)}`);
+    } finally {
+      for (const [, e] of sessions) {
+        try {
+          e.session.release?.();
+        } catch {
+          /* ignore */
+        }
+      }
+      sessions.clear();
+      sessionEpOptions = null;
+    }
+  }
+  return best;
 }
 
 async function handleFrame(msg) {
