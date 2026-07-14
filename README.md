@@ -45,10 +45,10 @@ Everything can be set by env var or CLI flag. CLI flags win.
 |---|---|---|---|
 | Bind host | `HUMAN_DETECTION_HOST` | `--host` | `127.0.0.1` |
 | Bind port | `HUMAN_DETECTION_PORT` | `--port` | `8765` |
-| Model | `HUMAN_DETECTION_MODEL` | `--model` | `WALDO30_yolov8l_640x640.pt` |
+| Model | `HUMAN_DETECTION_MODEL` | `--model` | `WALDO30_yolov8l-p2_640x640.pt` |
 | Normal-light conf | `HUMAN_DETECTION_CONF` | `--conf` | `0.20` |
 | Low-light conf | `HUMAN_DETECTION_LOW_LIGHT_CONF` | `--low-light-conf` | `0.12` |
-| Min box fraction | `HUMAN_DETECTION_MIN_BOX_FRACTION` | (n/a) | `0.02` |
+| Min box fraction | `HUMAN_DETECTION_MIN_BOX_FRACTION` | (n/a) | `0.04` |
 | Max streams | `HUMAN_DETECTION_MAX_STREAMS` | (n/a) | `10` |
 
 ### Endpoints
@@ -148,7 +148,7 @@ when there are fewer than 25 detections; hidden above that to avoid clutter.
 | Flag | Default | Description |
 |---|---|---|
 | `--conf` | `0.20` | Confidence threshold |
-| `--model` | `WALDO30_yolov8l_640x640.pt` | Override model filename |
+| `--model` | `WALDO30_yolov8l-p2_640x640.pt` | Override model filename |
 | `--sliced` | off | Use SAHI sliced (tiled) inference |
 | `--slice-size` | `320` | Tile size in pixels for sliced inference |
 | `--slice-overlap` | `0.2` | Fractional tile overlap |
@@ -171,19 +171,41 @@ runs when off").
 
 ## Model choice
 
-Benchmarked 5 WALDO variants across 12 overhead test images. Results:
+Default: **`WALDO30_yolov8l-p2_640x640.pt`** (~90 MB).
+
+The `-p2` suffix denotes the small-object detection-head variant of
+WALDO30. Vanilla yolov8l has detection heads at strides 8 / 16 / 32;
+the `-p2` build adds a stride-4 head, which is materially better at
+the 12-30 px-tall people we typically see at delivery altitudes on the
+production 320×240 stream. The WALDO author (Stephan Sturges) was
+unambiguous on this when we asked: **"you definitely need to use the
+-p2 model variants, those are way better at small objects like people"**.
+
+Internal benchmark history across 12 overhead test images is preserved
+below for context — note these numbers are on standard-resolution test
+imagery, *not* the 320×240 delivery feed where the choice of -p2 vs
+plain has the largest practical impact:
 
 | Model | Total dets (std) | Hard-image dets | Notes |
 |---|---|---|---|
 | `yolov8n` | 607 | 2/8 | Fastest, weakest on sparse scenes |
-| `yolov8m` | 1,185 | 4/8 | Previous default |
-| `yolov8m-p2` | 1,061 | 1/8 | Worse than plain medium on this set |
-| **`yolov8l`** | **1,210** | **7/8** | **Current default — best accuracy** |
-| `yolov8l-p2` | 1,184 | 7/8 | Tied with large, slower |
+| `yolov8m` | 1,185 | 4/8 | Older default |
+| `yolov8m-p2` | 1,061 | 1/8 | Underperforms on standard-res imagery |
+| `yolov8l` | 1,210 | 7/8 | Previous default before the 320×240 production feed |
+| **`yolov8l-p2`** | **1,184** | **7/8** | **Current default — small-object head wins on the 320×240 feed** |
 
-Default: **`WALDO30_yolov8l_640x640.pt`** (~87 MB).
+Override via `--model` or `HUMAN_DETECTION_MODEL`. Other variants on
+[StephanST/WALDO30](https://huggingface.co/StephanST/WALDO30) worth
+knowing about:
 
-Override via `--model` or `HUMAN_DETECTION_MODEL` env var.
+- `WALDO30_yolov8l-p2_1024x1024.pt` — same head, trained natively at
+  1024×1024. Pair with `HUMAN_DETECTION_IMGSZ=1024` for the best
+  achievable recall on small targets, at ~2.5× the inference cost.
+  Switch to this once the pilot hardware has the headroom (or when
+  running offline benchmarks).
+- `WALDO30_yolov8m-p2_640x640.pt` / `WALDO30_yolov8n-p2_640x640.pt` —
+  smaller backbones if `l-p2` is too slow on a particular pilot PC.
+  Trade some accuracy for ~2× / ~4× throughput respectively.
 
 ## Inference modes
 
@@ -219,7 +241,7 @@ Controlled by these `Config` fields (all env-var overridable):
 |---|---|---|
 | `tracking_enabled` | `true` | Master switch. `false` reverts to the old stateless confidence filter. |
 | `candidate_conf_threshold` | `0.10` | Raw detector floor. Lower = more candidates for the tracker's "recovery" pool. |
-| `track_lost_buffer_frames` | `5` | Frames without a sighting before a track is dropped (~5 s at 1 Hz). |
+| `track_lost_buffer_frames` | `15` | Frames without a sighting before a track is dropped (~15 s at 1 Hz). Tuned to bridge the baked-in HUD crosshair on real Manna delivery footage: a person walking under the crosshair re-associates with the same `track_id` on the other side, preserving the EMA confidence and the track-length gate's accumulated state. |
 | `track_iou_threshold` | `0.6` | IoU required to match a detection to an existing track. Relaxed from the library default (`0.8`) because at 1 Hz people move further between frames. |
 | `track_stale_reset_secs` | `8.0` | If a `uavId` goes silent for this long, its tracker is reset on the next frame. Avoids carrying stale associations across scene changes. |
 
@@ -300,7 +322,7 @@ spend frames associating with.
 
 | Filter | Config | Default | What it rejects |
 |---|---|---|---|
-| Min box size | `min_box_fraction` | `0.02` | Detections whose shorter side is < 2% of the frame's shorter side (noise, distant power-pole tops). |
+| Min box size | `min_box_fraction` | `0.04` | Detections whose shorter side is < 4% of the frame's shorter side. The dominant FP class on real Manna delivery footage is small floor objects (delivery markers, tools, debris) that YOLO classifies as Person; tightening this is the single highest-impact cull. Lower it for sub-240p source feeds or very high-altitude operation where humans themselves approach 4%. |
 | Aspect ratio | `aspect_ratio_min`, `aspect_ratio_max` | `0.25`, `4.0` | Very wide (power lines, fences, hose reels) or very tall (lamp-posts, pipes) boxes that a real person viewed from above cannot produce. |
 
 Either filter disables when its threshold is non-positive (useful for
@@ -315,6 +337,59 @@ comparing against an un-filtered run during QA).
 This kills single-frame hallucinations of borderline detections
 (bushes, shadows) without delaying real-time response for clear hits.
 Set to `1` to disable.
+
+### Per-track motion shaping (during hover-boost)
+
+The hover motion gate looks at *single-frame* pixel motion inside each
+detection box. This complementary gate looks at each **`track_id`'s**
+sliding window of recent box-centre positions and shapes the effective
+confidence floor based on how much that track has actually moved:
+
+- A **moving** track (max displacement across the window
+  ≥ `track_motion_displacement_px`) gets the floor lowered to
+  `track_motion_boosted_conf`. Rescues genuinely-walking subjects whose
+  per-frame conf wobbles below the normal threshold — the "person moving
+  → trust the detection" intuition.
+- A **fully-static** track (window populated AND max displacement
+  < `track_static_displacement_px`) gets the floor *raised* to
+  `track_static_penalty_conf`, deliberately set ABOVE the normal floor.
+  Catches the bushes / pool covers / garden statues that the model
+  flashes at moderate confidence but that never actually move.
+- Anything in between (small drift, or window still warming up) falls
+  back to the normal floor — no opinion either way.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `track_motion_gate_enabled` | `true` | Master switch. Disable for A/B testing. |
+| `track_motion_window_frames` | `5` | Sliding-window size in tracked sightings. 5 ≈ 5 s at the nominal 1 Hz hover rate. |
+| `track_motion_displacement_px` | `20.0` | Window max-displacement (px) at or above which the track is "visibly moving". |
+| `track_static_displacement_px` | `5.0` | Window max-displacement (px) below which (with a full window) the track is treated as fully static. |
+| `track_motion_boosted_conf` | `0.08` | Effective floor for moving tracks. Sits below `candidate_conf_threshold` so any tracker-matched candidate is rescued. |
+| `track_static_penalty_conf` | `0.30` | Effective floor for fully-static tracks (THAT HAVE NEVER MOVED — see persistent trust below). Sits above `confidence_threshold` so even mid-confidence static hits get suppressed. |
+| `track_motion_persistent_trust_enabled` | `true` | Once a track has been observed moving above `track_motion_displacement_px` at any point, the static penalty AND the per-frame hover motion gate both defer to the normal floor for that track for the rest of its life. Lets a person who walked in then stopped (e.g. waiting on the delivery pad) keep surfacing without conflating them with a never-moved FP. Disable to A/B the old "static always = suspicious" behaviour. |
+
+The gate is **hover-scoped on purpose**: at typical cruise speed + 1 Hz
+sampling, image-space displacement on every box is dominated by camera
+motion, not object motion — running this during cruise would spuriously
+boost stationary FPs and falsely penalise slow-moving humans.
+Telemetry-driven camera-motion-compensation (CMC) is the natural follow-
+up that would let this gate fire during cruise too (see roadmap §11).
+
+### Per-track confidence smoothing
+
+Pure post-processing of the value the dashboard renders — does NOT
+affect gate decisions. Each tracker-matched detection's confidence is
+replaced by an exponential moving average over that track's history, so
+a model that emits `0.25 → 0.34 → 0.27 → 0.31` on a stable track
+displays a smoothly-evolving number instead of jitter.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `track_conf_smoothing_enabled` | `true` | Master switch. Disable to see the raw per-frame conf. |
+| `track_conf_ema_alpha` | `0.4` | Weight on the new sample: `new_ema = alpha * raw + (1 - alpha) * prev`. Lower = smoother but more lag. |
+
+Untracked detections (no `tracker_id`) pass through unchanged — there's
+no track identity to attach an EMA to.
 
 ## Model warm-up
 
@@ -405,6 +480,9 @@ Key files:
 - [`scripts/run_sidecar.py`](scripts/run_sidecar.py) — sidecar entry point.
 - [`src/human_detection/demo/`](src/human_detection/demo/) — browser demo page
   (HTML/JS/CSS) served at `/demo`.
+- [`src/human_detection/webdemo/`](src/human_detection/webdemo/) — in-browser
+  inference demo (onnxruntime-web + JS pipeline port) served at `/webdemo`;
+  see [`docs/webdemo.md`](docs/webdemo.md).
 
 ## Demo page
 
@@ -425,7 +503,9 @@ is running, open that URL in any modern browser. The page:
 
 Controls: change the tile count (1-30), rate (0.2-5 Hz), toggle
 `low-light mode` to exercise the reduced-confidence code path, hide
-labels, pause the send loop, or reset the rolling stats.
+labels, pause the send loop, or reset the rolling stats. In recording
+mode every tile has a timeline scrub bar — drag to seek (display-only
+while dragging), release and detection resumes from there.
 
 Notes:
 
@@ -441,6 +521,28 @@ Notes:
   kernels to compile — subsequent inferences are ~80-100 ms. This
   means a freshly-started sidecar will show 0 det on all tiles for the
   first ~30 s; after that boxes appear live.
+
+## In-browser demo (`/webdemo`)
+
+A second demo at [`http://127.0.0.1:8765/webdemo`](http://127.0.0.1:8765/webdemo)
+runs the **whole pipeline in the browser** — ONNX WALDO v3 via
+onnxruntime-web (WebNN → WebGPU → WASM) plus a JS port of all
+post-processing (crosshair inpaint, decode+NMS, ByteTrack, the full gate
+stack). The local sidecar only serves static assets and recordings, and
+acts as the reference pipeline for the built-in live compare overlay and
+browser-vs-local benchmark.
+
+One-time setup, then open the URL:
+
+```bash
+.venv/bin/python scripts/export_web_model.py --fetch-ort
+```
+
+Verified at accuracy parity with the local pipeline (exact post-processing
+match on 240/240 harness frames; 100% detection agreement on a 400-frame
+paced replay) and ~25-40% *faster* than the Python sidecar on Apple Silicon
+when Chrome's WebNN flag is enabled. Full architecture, parity methodology
+and benchmark results: [`docs/webdemo.md`](docs/webdemo.md).
 
 ## Recording & replay
 
@@ -633,7 +735,46 @@ many of those carry a ByteTrack-managed `trackId`. With the default
    `confidence_threshold`.
 3. Set back to `1` (default) to disable.
 
-### 10. Warm-up
+### 10. Per-track motion shaping (hover-only)
+
+1. Hover above a yard that contains a known persistent false positive
+   (bush / pool cover / garden statue / baked-in HUD crosshair). Wait
+   until the per-frame log shows `hover=True`.
+2. After `track_motion_window_frames` (default 5) sightings of the FP,
+   `after_track_motion` should drop below `after_motion` in the per-
+   frame log — the static-penalty branch is suppressing it. The FP
+   should NEVER reappear unless its raw conf clears 0.30.
+3. Walk into frame so the same person produces a track that ACCUMULATES
+   visible image-space motion. Sub-threshold per-frame conf (0.10–0.19)
+   should now surface, with `after_track_motion == after_motion`.
+4. **Persistent-trust check (issue 3 fix):** keep walking until the
+   tracker has clearly seen you moving, then STOP and stand still on
+   the delivery pad for 10+ seconds. The track must stay surfaced even
+   though your in-box pixel motion is now zero — that's the
+   has-moved-ever bypass keeping the per-frame hover motion gate AND
+   the static penalty off your back. To prove the bypass is what's
+   doing it, restart with `HUMAN_DETECTION_TRACK_PERSISTENT_TRUST=false`
+   and repeat: now you should start dropping out after the window fills.
+5. Disable the gate entirely with `HUMAN_DETECTION_TRACK_MOTION_GATE=false`
+   and re-run — the FP should reappear and the moving subject will
+   flicker back to surfacing only on its strong frames.
+6. Start the drone cruising and observe that the gate does NOT fire
+   (after_track_motion always equals after_motion). This is intentional
+   — image-space motion during cruise is dominated by camera motion.
+
+### 11. Per-track confidence smoothing
+
+1. Watch the `dets[i].conf` values on the wire (or in the demo overlay)
+   for a stable tracked person. With smoothing on (default), the conf
+   should evolve smoothly frame-to-frame even when the underlying model
+   is noisy.
+2. Disable with `HUMAN_DETECTION_TRACK_CONF_SMOOTHING=false` and re-run.
+   The same person's conf should now visibly jitter between frames.
+3. Track IDs and gate decisions must be identical between the two runs —
+   smoothing only changes the EMITTED conf value, not the keep/drop
+   pipeline.
+
+### 12. Warm-up
 
 1. Start the sidecar with a cold cache (kill the model from MPS if it
    was loaded). Watch the log: within a few seconds of
@@ -642,7 +783,7 @@ many of those carry a ByteTrack-managed `trackId`. With the default
 2. The first real frame's `ms` in the log should match subsequent
    frames (~80-150 ms on M3, not the ~30000 ms cold start).
 
-### 11. Recording round-trip
+### 13. Recording round-trip
 
 1. Start the sidecar and the /demo page (or a live manna-dash flight).
 2. Click the red **● record** button (or `POST /record/start`). Confirm

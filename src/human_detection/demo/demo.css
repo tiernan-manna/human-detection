@@ -119,6 +119,53 @@ h1 {
   font-weight: 500;
 }
 
+.stat-value.stat-good {
+  color: var(--ok);
+}
+
+.stat-value.stat-warn {
+  color: var(--warn);
+}
+
+.stat-value.stat-bad {
+  color: var(--err);
+}
+
+/* Lit when the sidecar is in HUMAN_DETECTION_DEBUG_RAW=true mode so the
+   operator can see at a glance that the dashed-yellow boxes on each tile
+   are the (extra) pre-gate detector output, not a UI bug. */
+.stat-value.debug-raw-on {
+  color: #ffd700;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.replay-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 10px;
+  padding: 6px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.replay-summary-label {
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-size: 10px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+#replay-summary-text {
+  color: var(--text);
+}
+
 .controls-row {
   display: flex;
   gap: 16px;
@@ -147,6 +194,17 @@ h1 {
   border-radius: 4px;
   font-family: inherit;
   font-size: 13px;
+}
+
+.controls-row select {
+  padding: 4px 6px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+  max-width: 320px;
 }
 
 .controls-row button {
@@ -182,6 +240,73 @@ main#grid {
   flex-direction: column;
 }
 
+/* Expand button — bottom-right of each tile's media area. We render
+   it with a visible text label ("Expand" / "Collapse") plus an arrow
+   glyph so users discover the feature without having to hover, and so
+   the control still works on browsers/fonts that render the bare
+   "⤢" glyph as a tofu box. Bottom-right keeps it clear of detection
+   labels which align to the top of each box. */
+.tile-expand-btn {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  z-index: 4;
+  height: 30px;
+  padding: 0 10px;
+  gap: 6px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.75);
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  opacity: 0.85;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  transition: opacity 120ms ease, background 120ms ease,
+    transform 120ms ease;
+}
+
+.tile-expand-btn .tile-expand-btn__glyph {
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.tile:hover .tile-expand-btn,
+.tile.tile--expanded .tile-expand-btn,
+.tile-expand-btn:hover,
+.tile-expand-btn:focus-visible {
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.9);
+  transform: translateY(-1px);
+}
+
+/* Expanded tile spans the full grid row and grows to a comfortable
+   review size, while the other tiles keep running in the grid above
+   and below it. Capping width avoids stretching beyond what the
+   recorded JPEG can usefully fill on an ultrawide. */
+.tile.tile--expanded {
+  grid-column: 1 / -1;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.tile.tile--expanded .tile-media {
+  /* The media keeps its aspect-ratio (set per-tile from the image's
+     natural dimensions in JS) so the canvas overlay stays pixel-
+     aligned with the underlying <img>. Letting the grid column define
+     the width and the aspect-ratio fix the height keeps everything in
+     one source of truth. */
+  width: 100%;
+}
+
 .tile-media {
   position: relative;
   width: 100%;
@@ -207,6 +332,160 @@ main#grid {
   width: 100%;
   height: 100%;
   pointer-events: none;
+}
+
+/* Label overlay: a thin transparent div above the canvas that only
+   intercepts pointer events when label mode is on. We keep it z-index
+   below the expand button (z=4) so the expand control stays clickable
+   in all modes. */
+.tile-label-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  cursor: crosshair;
+}
+
+.tile-label-overlay.is-labelling {
+  pointer-events: auto;
+  /* Soft yellow highlight so the operator can SEE that they're in
+     label mode and won't be surprised when click-and-hold marks
+     frames. */
+  background: rgba(255, 213, 79, 0.05);
+}
+
+.tile-label-overlay .tile-label-rect {
+  position: absolute;
+  border: 2px dashed #ffd54f;
+  background: rgba(255, 213, 79, 0.12);
+  pointer-events: none;
+}
+
+.tile-label-overlay .tile-label-badge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(255, 213, 79, 0.9);
+  color: #1a1a1a;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+/* Cursor-position dot drawn under the operator's pointer during a
+   presence-mode hold. Visualises the (x, y) being attached to each
+   label so the operator can confirm "the cursor I see is the
+   coordinate being saved" — without this the point-supervision
+   capture is invisible and feels unreliable. Centered on the
+   pointer via translate(-50%,-50%); pointer-events:none so it
+   never steals input from the hold itself. */
+.tile-label-overlay .tile-label-cursor-dot {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  border-radius: 50%;
+  background: rgba(255, 213, 79, 0.45);
+  border: 2px solid #ffd54f;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 8px rgba(255, 213, 79, 0.7);
+}
+
+/* Live counter that ticks up as labels are saved for this tile.
+   Top-right of the media area, mirrors the LABEL badge in the
+   top-left so the operator can see at a glance: "labelling is on
+   AND N labels have been saved this session". */
+.tile-label-overlay .tile-label-counter {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(13, 17, 23, 0.85);
+  color: #ffd54f;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+  border: 1px solid rgba(255, 213, 79, 0.5);
+  pointer-events: none;
+}
+
+/* Brief flash on the tile media after a successful label POST.
+   Distinct from the counter (which tells you "how many") because
+   the flash tells you "this most recent click actually landed".
+   Both together rebuild operator trust after the "did you get
+   any label data?" feedback gap. */
+.tile-media.label-saved-flash::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 213, 79, 0.18);
+  pointer-events: none;
+  animation: label-saved-flash 360ms ease-out;
+  z-index: 3;
+}
+
+@keyframes label-saved-flash {
+  0% {
+    background: rgba(255, 213, 79, 0.35);
+  }
+  100% {
+    background: rgba(255, 213, 79, 0);
+  }
+}
+
+/* "label style" select is hidden until label mode is enabled to keep
+   the control row clean by default. The body class is toggled in JS. */
+body.is-label-mode-off .ctl-label-submode {
+  display: none;
+}
+
+/* Replay timeline scrubber (replay tiles only). */
+.tile-scrub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-top: 1px solid var(--border);
+}
+.tile-scrub .scrub-range {
+  flex: 1;
+  height: 4px;
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+.tile-scrub .scrub-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+}
+.tile-scrub .scrub-range::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+}
+.tile-scrub .scrub-pos {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  min-width: 64px;
+  text-align: right;
 }
 
 .tile-footer {
@@ -264,6 +543,83 @@ footer code {
   padding: 1px 5px;
   border-radius: 3px;
   font-size: 11px;
+}
+
+/* --- Replay frame-window row ------------------------------------------- */
+.replay-window-row {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 10px;
+  padding: 8px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.replay-window-label {
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.replay-window-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.replay-window-row input[type="number"] {
+  width: 80px;
+  padding: 4px 6px;
+  background: var(--bg-raised);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.replay-window-row button {
+  padding: 4px 10px;
+  background: var(--bg-raised);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.replay-window-row button:hover {
+  background: var(--border);
+  border-color: var(--accent);
+}
+
+.replay-window-row button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+#replay-window-status {
+  margin-left: auto;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+#replay-window-status.windowed {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+#replay-window-status.empty {
+  color: var(--err);
 }
 
 /* --- Record button ------------------------------------------------------ */

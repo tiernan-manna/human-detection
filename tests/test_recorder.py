@@ -418,6 +418,212 @@ def test_selection_endpoint_validates_payload(client: TestClient):
     assert bad2.status_code == 400
 
 
+# --- Recording manifest + frame endpoints (replay-mode demo) -------------
+
+
+def _record_a_simple_session(
+    client: TestClient, uav_ids=("uav-r1",), per_uav: int = 2
+) -> str:
+    """Helper: capture `per_uav` frames per uav, return the session leaf
+    name. Used by the replay-endpoint tests below so each test is hermetic.
+    """
+    client.post("/record/start", json={"sessionName": "replay-test"}).raise_for_status()
+    seq = 0
+    with client.websocket_connect("/detect") as ws:
+        for uav in uav_ids:
+            for i in range(per_uav):
+                seq += 1
+                ws.send_bytes(
+                    _envelope(
+                        {
+                            "uavId": uav,
+                            "ts": 1_000 + seq,
+                            "isLowLight": bool(i % 2),
+                            "imgW": 32,
+                            "imgH": 32,
+                            "telemetry": {"altitude": 25.0 + i, "heading": 90.0},
+                        },
+                        _tiny_jpeg(seq),
+                    )
+                )
+                json.loads(ws.receive_text())
+    client.post("/record/stop")
+    return client.get("/recordings").json()[0]["name"]
+
+
+def test_recording_manifest_returns_per_uav_streams(client: TestClient):
+    name = _record_a_simple_session(client, uav_ids=("uav-a", "uav-b"), per_uav=3)
+    r = client.get(f"/recordings/{name}/manifest")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["session"]["frames_total"] == 6
+    assert body["session"]["uav_ids"] == ["uav-a", "uav-b"]
+    assert body["session"]["telemetry_coverage"] == 6
+    assert len(body["frames"]) == 6
+    assert sorted(body["streams"].keys()) == ["uav-a", "uav-b"]
+    for uav, idxs in body["streams"].items():
+        assert all(body["frames"][i]["uavId"] == uav for i in idxs)
+    # Every frame URL must point under the session dir.
+    for fr in body["frames"]:
+        assert fr["jpegUrl"].startswith(f"/recordings/{name}/frames/")
+        assert fr["telemetry"] == {"altitude": pytest.approx(fr["telemetry"]["altitude"]), "heading": 90.0}
+
+
+def test_capture_returns_seq_and_record_result_persists(tmp_path: Path):
+    """capture() must hand back the assigned seq so the WS reply wrapper
+    can pair the upcoming inference reply with the same frame, and
+    record_result must write a parseable line to live_results.jsonl."""
+    cfg = Config()
+    rec = Recorder(cfg, base_dir=tmp_path)
+
+    async def _go():
+        await rec.start_session(name="result-test")
+        seq = rec.capture(
+            uav_id="uav-r",
+            client_ts_ms=1000,
+            is_low_light=False,
+            img_w=32,
+            img_h=32,
+            jpeg=_tiny_jpeg(1),
+            telemetry={"altitude": 25.0},
+        )
+        assert isinstance(seq, int) and seq == 1
+        rec.record_result(
+            seq=seq,
+            uav_id="uav-r",
+            client_ts_ms=1000,
+            inference_ms=42.5,
+            detections=[{"x1": 10, "y1": 10, "x2": 20, "y2": 30, "conf": 0.7, "cls": "Person"}],
+            dropped=False,
+        )
+        # Excluded uav: capture returns None and record_result for an
+        # unknown seq should be a quiet no-op (no exceptions, no line).
+        rec.set_excluded_uavs(["uav-skip"])
+        skipped = rec.capture(
+            uav_id="uav-skip",
+            client_ts_ms=2000,
+            is_low_light=False,
+            img_w=32,
+            img_h=32,
+            jpeg=_tiny_jpeg(2),
+        )
+        assert skipped is None
+        await rec.stop_session()
+        assert rec.status().results_recorded == 1
+
+    asyncio.run(_go())
+
+    results_path = next(tmp_path.iterdir()) / "live_results.jsonl"
+    lines = [
+        json.loads(line) for line in results_path.read_text().splitlines() if line
+    ]
+    assert len(lines) == 1
+    assert lines[0]["seq"] == 1
+    assert lines[0]["uav_id"] == "uav-r"
+    assert lines[0]["inference_ms"] == 42.5
+    assert lines[0]["dropped"] is False
+    assert lines[0]["detections"][0]["cls"] == "Person"
+
+
+def test_ws_records_live_detection_alongside_frame(client: TestClient):
+    """End-to-end: a captured frame's reply makes it into
+    live_results.jsonl and the manifest endpoint joins them on seq."""
+    client.post("/record/start", json={"sessionName": "live-result"}).raise_for_status()
+    with client.websocket_connect("/detect") as ws:
+        for i in range(3):
+            ws.send_bytes(
+                _envelope(
+                    {
+                        "uavId": "uav-live",
+                        "ts": 1_000 + i,
+                        "isLowLight": False,
+                        "imgW": 32,
+                        "imgH": 32,
+                        "telemetry": {"altitude": 25.0},
+                    },
+                    _tiny_jpeg(i + 1),
+                )
+            )
+            json.loads(ws.receive_text())
+    stop = client.post("/record/stop").json()
+    assert stop["frames_captured"] == 3
+    assert stop["results_recorded"] == 3
+
+    name = stop["session_name"]
+    body = client.get(f"/recordings/{name}/manifest").json()
+    assert body["session"]["live_results_recorded"] == 3
+    assert all(fr.get("liveResult") is not None for fr in body["frames"])
+    # Detector is the no-op stub (returns no detections), but the result
+    # blob shape must still match what the demo expects.
+    fr0 = body["frames"][0]
+    assert "inferenceMs" in fr0["liveResult"]
+    assert "dropped" in fr0["liveResult"]
+    assert fr0["liveResult"]["detections"] == []
+
+
+def test_recordings_list_reports_telemetry_coverage(client: TestClient):
+    # Session with telemetry: the helper attaches it on every frame.
+    name_with = _record_a_simple_session(client, uav_ids=("uav-t",), per_uav=2)
+    # Session WITHOUT telemetry: send raw frames omitting the key. The
+    # recorder logs a one-shot warning and accepts them; the manifest
+    # should reflect zero coverage so the replay-mode UI can hide it.
+    client.post("/record/start", json={"sessionName": "no-tele"}).raise_for_status()
+    with client.websocket_connect("/detect") as ws:
+        for i in range(2):
+            ws.send_bytes(
+                _envelope(
+                    {
+                        "uavId": "uav-bare",
+                        "ts": 5_000 + i,
+                        "isLowLight": False,
+                        "imgW": 32,
+                        "imgH": 32,
+                    },
+                    _tiny_jpeg(50 + i),
+                )
+            )
+            json.loads(ws.receive_text())
+    client.post("/record/stop")
+
+    listing = {m["name"]: m for m in client.get("/recordings").json()}
+    assert listing[name_with]["frames_with_telemetry"] == 2
+    bare = next(m for n, m in listing.items() if n != name_with)
+    assert bare["frames_captured"] == 2
+    assert bare["frames_with_telemetry"] == 0
+
+
+def test_recording_manifest_404s_on_missing(client: TestClient):
+    assert client.get("/recordings/does-not-exist/manifest").status_code == 404
+
+
+def test_recording_manifest_rejects_traversal(client: TestClient):
+    # FastAPI normalises ../ before our handler sees it, so probe a name
+    # that actually reaches the guard.
+    assert client.get("/recordings/.hidden/manifest").status_code == 400
+
+
+def test_recording_frame_serves_bytes_and_validates(client: TestClient):
+    name = _record_a_simple_session(client, uav_ids=("uav-r",), per_uav=2)
+    manifest = client.get(f"/recordings/{name}/manifest").json()
+    fr = manifest["frames"][0]
+    served = client.get(fr["jpegUrl"])
+    assert served.status_code == 200
+    assert served.headers["content-type"] == "image/jpeg"
+    assert served.content == _tiny_jpeg(1)
+    # immutable cache so the demo's replay loop doesn't re-fetch
+    assert "immutable" in served.headers.get("cache-control", "")
+
+    # Bad filename rejected.
+    bad = client.get(f"/recordings/{name}/frames/.hidden")
+    assert bad.status_code == 400
+    # Non-image extension rejected.
+    bad2 = client.get(f"/recordings/{name}/frames/notes.txt")
+    assert bad2.status_code == 400
+    # Missing file returns 404 even with a valid-looking name.
+    bad3 = client.get(f"/recordings/{name}/frames/999999.jpg")
+    assert bad3.status_code == 404
+
+
 # --- Path safety ---------------------------------------------------------
 
 

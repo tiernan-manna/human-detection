@@ -5,8 +5,14 @@ ws://127.0.0.1:8765/detect to get red-box detections drawn over live video.
 
 Typical invocation:
     python scripts/run_sidecar.py
-    python scripts/run_sidecar.py --port 8765 --model WALDO30_yolov8m_640x640.pt
+    python scripts/run_sidecar.py --port 8765
     HUMAN_DETECTION_CONF=0.25 python scripts/run_sidecar.py
+
+    # Higher-recall opt-in for low-resolution feeds (e.g. 320x240 delivery
+    # streams). Pairs the natively-1024 -p2 weights with imgsz=1024 so the
+    # network runs at the resolution it was trained at:
+    HUMAN_DETECTION_MODEL=WALDO30_yolov8l-p2_1024x1024.pt \
+        HUMAN_DETECTION_IMGSZ=1024 python scripts/run_sidecar.py
 
 All env vars understood by `Config.from_env` are also honoured. Command-line
 flags override env vars.

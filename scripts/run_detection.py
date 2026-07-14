@@ -79,11 +79,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min-box-fraction",
         type=float,
-        default=0.02,
+        default=0.04,
         help=(
             "Minimum bounding-box side as a fraction of the shorter image dimension. "
-            "Detections smaller than this are discarded as noise (cords, bushes, etc.). "
-            "Scales automatically with resolution. 0 to disable."
+            "Detections smaller than this are discarded as noise (cords, bushes, "
+            "small floor objects that YOLO mis-classes as people). Scales "
+            "automatically with resolution. 0 to disable."
         ),
     )
     return p

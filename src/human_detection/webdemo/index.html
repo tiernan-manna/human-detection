@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store, must-revalidate" />
+  <!--
+    WebNN Origin Trial token. This is the ONLY way to give WebNN to stock Chrome
+    without each user touching chrome://flags: register the deploy origin at
+    https://developer.chrome.com/origintrials (search "WebNN"), paste the token
+    below, uncomment, and every visitor on that origin gets navigator.ml — the
+    worker's auto chain (webnn -> webgpu -> wasm) then picks WebNN automatically.
+    The trial is intermittently disabled upstream; until it's live this is a
+    no-op and the page runs on WebGPU (default-on, no setup). See docs/webdemo.md.
+  -->
+  <!-- <meta http-equiv="origin-trial" content="PASTE_WEBNN_ORIGIN_TRIAL_TOKEN_HERE" /> -->
+  <title>Human Detection — In-Browser (WebNN / WebGPU)</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22><rect width=%2216%22 height=%2216%22 rx=%223%22 fill=%22%230b1020%22/><rect x=%223%22 y=%223%22 width=%2210%22 height=%2210%22 rx=%221%22 fill=%22none%22 stroke=%22%234ade80%22 stroke-width=%221.5%22/></svg>" />
+  <link rel="stylesheet" href="/webdemo/webdemo.css" />
+</head>
+<body>
+  <header>
+    <div class="title-row">
+      <h1>Human Detection — In-Browser</h1>
+      <span id="ep-pill" class="state-pill state-pending" title="Active onnxruntime-web execution provider. webnn = Web Neural Network API (Chrome flag: --enable-features=WebMachineLearningNeuralNetwork), webgpu = WebGPU JSEP backend, wasm = CPU WebAssembly fallback.">loading…</span>
+      <span id="webnn-pill" class="state-pill state-pending" title="Whether the fast WebNN backend is active. WebNN runs ~3-4x faster than WebGPU on this hardware. If it's off, the page still works on WebGPU (no setup needed) — it's just slower.">WebNN —</span>
+      <span id="sidecar-pill" class="state-pill state-pending" title="Local sidecar reachability (used by the compare overlay and the benchmark). The browser pipeline itself never needs it.">sidecar?</span>
+    </div>
+
+    <div class="stats-row">
+      <div class="stat" title="Execution provider running the model. 'webnn' needs Chrome launched with --enable-features=WebMachineLearningNeuralNetwork; otherwise the demo falls back to WebGPU, then WASM.">
+        <span class="stat-label">backend</span>
+        <span class="stat-value stat-value-small" id="stat-ep">—</span>
+      </div>
+      <div class="stat" title="ONNX model file + precision in use. fp32 is the accuracy-parity default (dynamic shapes, letterboxed like the local sidecar); fp16 is the static 640x640 perf option.">
+        <span class="stat-label">model</span>
+        <span class="stat-value stat-value-small" id="stat-model">—</span>
+      </div>
+      <div class="stat" title="Model input tensor shape after letterboxing (matches the local sidecar's auto letterbox for the fp32 model).">
+        <span class="stat-label">input</span>
+        <span class="stat-value stat-value-small" id="stat-shape">—</span>
+      </div>
+      <div class="stat" title="Frames per second being sent into the in-browser pipeline across all tiles.">
+        <span class="stat-label">fps in</span>
+        <span class="stat-value" id="stat-fps-in">0.0</span>
+      </div>
+      <div class="stat" title="Frames per second the pipeline completed over the last second.">
+        <span class="stat-label">fps out</span>
+        <span class="stat-value" id="stat-fps-out">0.0</span>
+      </div>
+      <div class="stat" title="Mean end-to-end per-frame time over the last ~200 frames (preprocess + inference + decode + tracker).">
+        <span class="stat-label">avg ms</span>
+        <span class="stat-value" id="stat-avg-ms">0</span>
+      </div>
+      <div class="stat" title="95th percentile end-to-end per-frame time.">
+        <span class="stat-label">p95 ms</span>
+        <span class="stat-value" id="stat-p95-ms">0</span>
+      </div>
+      <div class="stat" title="Worker-only ceiling = 1000 / median pipeline ms (preprocess + inference + decode + tracker). Excludes main-thread JPEG decode, messaging, and drawing, so the page can't actually reach this rate — see 'e2e cap fps' for the achievable figure.">
+        <span class="stat-label">worker cap fps</span>
+        <span class="stat-value" id="stat-capacity">—</span>
+      </div>
+      <div class="stat" title="Achievable page rate = 1000 / median wall time per frame, measured on the main thread from tick start (JPEG fetch + bitmap decode) through worker round-trip to result. This is the number the replay Hz setting can realistically hit.">
+        <span class="stat-label">e2e cap fps</span>
+        <span class="stat-value" id="stat-capacity-e2e">—</span>
+      </div>
+      <div class="stat" title="Mean per-stage breakdown of the last ~200 frames: preprocess (crosshair mask + letterbox), model inference, decode+NMS, tracker/gates.">
+        <span class="stat-label">prep / infer / decode / track</span>
+        <span class="stat-value stat-value-small" id="stat-stages">—</span>
+      </div>
+      <div class="stat" title="Person detections per second across all tiles.">
+        <span class="stat-label">dets/s</span>
+        <span class="stat-value" id="stat-dets-rate">0</span>
+      </div>
+      <div class="stat" title="Gate funnel for the most recent frame: raw → after tracker → after hover-motion gate → after track-motion gate → after track-length gate (final adds persistence).">
+        <span class="stat-label">gate funnel</span>
+        <span class="stat-value stat-value-small" id="stat-funnel">—</span>
+      </div>
+    </div>
+
+    <div class="controls-row">
+      <label title="Execution provider preference. auto = try WebNN, then WebGPU, then WASM. Changing this reloads the model.">
+        backend
+        <select id="ctl-ep">
+          <option value="auto" selected>auto (webnn → webgpu → wasm)</option>
+          <option value="webnn">webnn</option>
+          <option value="webgpu">webgpu</option>
+          <option value="wasm">wasm</option>
+        </select>
+      </label>
+      <label title="Model precision. fp32 = accuracy-parity default (dynamic shapes letterboxed exactly like the local sidecar). fp16 = static 640×640 export, ~half the memory traffic, may be faster on GPU backends. Changing this reloads the model.">
+        precision
+        <select id="ctl-precision">
+          <option value="fp32" selected>fp32 (parity)</option>
+          <option value="fp16">fp16 (perf)</option>
+        </select>
+      </label>
+      <label title="What each tile feeds the pipeline. 'recording' replays a captured session with original telemetry + low-light flags, so the hover/altitude/motion gates behave exactly as in flight.">
+        source
+        <select id="ctl-source">
+          <option value="recording" selected>recording</option>
+          <option value="still">still images</option>
+        </select>
+      </label>
+      <label id="ctl-recording-wrap" title="Which captured session to replay.">
+        recording
+        <select id="ctl-recording"></select>
+      </label>
+      <label title="Number of simulated drone tiles. Each tile is an independent uavId with its own tracker state.">
+        tiles
+        <input type="number" id="ctl-tiles" min="0" max="12" value="1" />
+      </label>
+      <label title="Frame rate per tile. Production is 1-2 Hz per drone.">
+        rate (Hz)
+        <input type="number" id="ctl-hz" min="1" max="30" step="1" value="2" />
+      </label>
+      <label class="checkbox" title="Sets the isLowLight flag on every frame (lower confidence threshold, like the dusk→sunrise window).">
+        <input type="checkbox" id="ctl-low-light" />
+        low-light
+      </label>
+      <label class="checkbox" title="Draw the detector's pre-gate output (dashed amber) alongside the gated output so you can see what the temporal gates dropped.">
+        <input type="checkbox" id="ctl-raw" />
+        show raw
+      </label>
+      <label class="checkbox" title="Also send every frame to the LOCAL sidecar over /detect and draw its boxes (dashed cyan) on the same tiles for a live side-by-side. Requires the sidecar's detector to be warm.">
+        <input type="checkbox" id="ctl-compare" />
+        compare vs sidecar
+      </label>
+      <label class="checkbox" title="Toggle the 'Person 0.74 #3' labels on detections (drawing-only).">
+        <input type="checkbox" id="ctl-labels" checked />
+        labels
+      </label>
+      <button id="ctl-pause" type="button">pause</button>
+      <button id="ctl-reset" type="button" title="Zero the latency/fps counters and reset all tracker state.">reset</button>
+    </div>
+
+    <div class="controls-row bench-row">
+      <strong class="bench-title" title="Replays the selected recording through BOTH pipelines — in-browser (this page) and the local sidecar (/detect WebSocket) — with identical frames, telemetry and pacing, then reports latency and detection agreement.">benchmark</strong>
+      <label title="How many frames of the recording to run through both pipelines.">
+        frames
+        <input type="number" id="bench-frames" min="20" max="2000" step="10" value="200" />
+      </label>
+      <label title="Concurrent streams to simulate. 1 = serial latency A/B vs the sidecar (default). >1 = live multi-tile throughput test: this many virtual tiles each send at the Hz rate through the single shared worker, reproducing the live send path (cached fetch + main-thread decode + per-tile in-flight skip). Reports achieved vs offered FPS and drop rate — the honest 'how many live tiles can I watch' number.">
+        streams
+        <input type="number" id="bench-streams" min="1" max="40" step="1" value="1" />
+      </label>
+      <label title="Duration of the concurrent throughput test, in seconds (ignored for the 1-stream serial A/B).">
+        secs
+        <input type="number" id="bench-secs" min="5" max="120" step="5" value="20" />
+      </label>
+      <label title="Pacing. 'paced' sends at the rate (Hz) control — gates see flight-like wall-clock timing in BOTH pipelines, so detection agreement is apples-to-apples. 'uncapped' sends each frame as soon as the previous completes — max throughput, but time-based gates (hover dwell) compress differently per pipeline, so agreement is indicative only.">
+        pacing
+        <select id="bench-pacing">
+          <option value="paced" selected>paced (agreement)</option>
+          <option value="uncapped">uncapped (throughput)</option>
+        </select>
+      </label>
+      <button id="bench-run" type="button">run benchmark</button>
+      <button id="bench-cancel" type="button" hidden>cancel</button>
+      <span id="bench-status" class="bench-status">—</span>
+      <a id="bench-download" hidden download="webgpu-vs-local-bench.json">download JSON</a>
+    </div>
+
+    <div id="bench-results" class="bench-results" hidden></div>
+    <div id="boot-error" class="boot-error" hidden></div>
+
+    <div id="webnn-help" class="webnn-help" hidden>
+      <button id="webnn-help-close" class="webnn-help-close" type="button" title="Dismiss">&times;</button>
+      <div class="webnn-help-title">⚡ WebNN is off — running on the slower WebGPU backend</div>
+      <p class="webnn-help-lead" id="webnn-help-lead">
+        WebNN runs roughly <strong>3–4× faster</strong> on this machine. It's a Chrome
+        feature that has to be switched on when Chrome starts — the page still works
+        without it, this is purely a speed upgrade.
+        <strong>Fully quit Chrome first</strong> (Cmd-Q / close every window), then run
+        the command for your system and reopen this page:
+      </p>
+
+      <div class="webnn-cmd" data-os="mac">
+        <div class="webnn-cmd-head">
+          <span class="webnn-os">macOS</span>
+          <button class="copy-btn" type="button" data-target="cmd-mac">copy</button>
+        </div>
+        <code id="cmd-mac">open -na "Google Chrome" --args --enable-features=WebMachineLearningNeuralNetwork</code>
+      </div>
+
+      <div class="webnn-cmd" data-os="win">
+        <div class="webnn-cmd-head">
+          <span class="webnn-os">Windows (PowerShell)</span>
+          <button class="copy-btn" type="button" data-target="cmd-win">copy</button>
+        </div>
+        <code id="cmd-win">&amp; "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" --enable-features=WebMachineLearningNeuralNetwork</code>
+      </div>
+
+      <div class="webnn-cmd" data-os="linux">
+        <div class="webnn-cmd-head">
+          <span class="webnn-os">Linux</span>
+          <button class="copy-btn" type="button" data-target="cmd-linux">copy</button>
+        </div>
+        <code id="cmd-linux">google-chrome --enable-features=WebMachineLearningNeuralNetwork</code>
+      </div>
+
+      <p class="webnn-help-foot">
+        Prefer clicking? Open <code>chrome://flags/#web-machine-learning-neural-network</code>,
+        set it to <strong>Enabled</strong>, and relaunch. Reload this page afterwards — the
+        badge turns green when WebNN is active. (Not on Chrome/Edge? WebNN only works on
+        Chromium browsers today.)
+      </p>
+    </div>
+  </header>
+
+  <main id="grid"></main>
+
+  <footer>
+    <span>
+      This page runs the <em>entire</em> detection pipeline in your browser:
+      ONNX WALDO v3 via onnxruntime-web (WebNN → WebGPU → WASM), plus a JS
+      port of the sidecar's post-processing (crosshair inpaint, ByteTrack,
+      hover/altitude/motion gates, predicted-box persistence). The local
+      sidecar is only used to serve recordings/model files — and as the
+      reference pipeline for the compare overlay and benchmark. WebNN needs
+      Chrome started with
+      <code>--enable-features=WebMachineLearningNeuralNetwork</code>.
+    </span>
+  </footer>
+
+  <script type="module" src="/webdemo/js/app.js"></script>
+</body>
+</html>
