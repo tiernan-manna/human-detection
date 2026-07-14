@@ -451,7 +451,13 @@ function startTicker() {
     for (const tile of STATE.tiles) {
       if (tile.nextDueAt == null) tile.nextDueAt = now;
       if (now < tile.nextDueAt || tile.inflight || tile.scrubbing) continue;
-      tile.nextDueAt = now + period;
+      // Advance from the scheduled slot, not the (late) fire time — otherwise
+      // the ticker's 15 ms resolution compounds into a lower effective rate
+      // (~16 fps at a 19 Hz setting). If the tile fell more than a period
+      // behind (frame slower than the period), skip the missed slots instead
+      // of bursting to catch up.
+      tile.nextDueAt += period;
+      if (tile.nextDueAt <= now) tile.nextDueAt = now + period;
       tickTile(tile);
     }
   }, res);
