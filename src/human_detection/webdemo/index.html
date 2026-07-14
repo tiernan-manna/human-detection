@@ -56,9 +56,13 @@
         <span class="stat-label">p95 ms</span>
         <span class="stat-value" id="stat-p95-ms">0</span>
       </div>
-      <div class="stat" title="Theoretical sustained throughput = 1000 / avg ms.">
-        <span class="stat-label">capacity fps</span>
+      <div class="stat" title="Worker-only ceiling = 1000 / median pipeline ms (preprocess + inference + decode + tracker). Excludes main-thread JPEG decode, messaging, and drawing, so the page can't actually reach this rate — see 'e2e cap fps' for the achievable figure.">
+        <span class="stat-label">worker cap fps</span>
         <span class="stat-value" id="stat-capacity">—</span>
+      </div>
+      <div class="stat" title="Achievable page rate = 1000 / median wall time per frame, measured on the main thread from tick start (JPEG fetch + bitmap decode) through worker round-trip to result. This is the number the replay Hz setting can realistically hit.">
+        <span class="stat-label">e2e cap fps</span>
+        <span class="stat-value" id="stat-capacity-e2e">—</span>
       </div>
       <div class="stat" title="Mean per-stage breakdown of the last ~200 frames: preprocess (crosshair mask + letterbox), model inference, decode+NMS, tracker/gates.">
         <span class="stat-label">prep / infer / decode / track</span>

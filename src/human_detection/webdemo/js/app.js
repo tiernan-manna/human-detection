@@ -19,6 +19,7 @@ const els = {
   statAvgMs: document.getElementById("stat-avg-ms"),
   statP95Ms: document.getElementById("stat-p95-ms"),
   statCapacity: document.getElementById("stat-capacity"),
+  statCapacityE2e: document.getElementById("stat-capacity-e2e"),
   statStages: document.getElementById("stat-stages"),
   statDetsRate: document.getElementById("stat-dets-rate"),
   statFunnel: document.getElementById("stat-funnel"),
@@ -65,6 +66,7 @@ const STATE = {
   showLabels: true,
   // rolling stats
   timings: [],
+  wallTimings: [], // main-thread tick-start -> result, per live tile frame
   timingsCap: 200,
   sentTick: 0,
   recvTick: 0,
@@ -475,6 +477,7 @@ async function tickTile(tile) {
   tile.inflight = true;
   const id = nextFrameId();
   tile.inflightId = id;
+  tile.inflightStartedAt = performance.now();
   STATE.sentTick++;
   try {
     const url = tile.source.still ? frame.url : frame.jpegUrl;
@@ -525,6 +528,10 @@ function onWorkerResult(msg) {
   STATE.detsTick += msg.detections.length;
   STATE.timings.push(msg.timing);
   if (STATE.timings.length > STATE.timingsCap) STATE.timings.shift();
+  if (tile && tile.inflightStartedAt) {
+    STATE.wallTimings.push(performance.now() - tile.inflightStartedAt);
+    if (STATE.wallTimings.length > STATE.timingsCap) STATE.wallTimings.shift();
+  }
   STATE.lastFunnel = msg.gateCounts;
   els.statShape.textContent = msg.shape;
   if (!tile) return;
@@ -708,6 +715,15 @@ function startStatsTicker() {
       els.statAvgMs.textContent = median.toFixed(0);
       els.statP95Ms.textContent = p95.toFixed(0);
       els.statCapacity.textContent = (1000 / median).toFixed(1);
+      // End-to-end capacity: same median basis, but over the main-thread wall
+      // time per frame (fetch + bitmap decode + worker round-trip). This is
+      // the rate the page can actually sustain, unlike the worker-only figure.
+      const walls = STATE.wallTimings;
+      if (walls.length) {
+        const sortedWalls = [...walls].sort((a, b) => a - b);
+        const wallMedian = sortedWalls[Math.floor(sortedWalls.length / 2)];
+        els.statCapacityE2e.textContent = (1000 / wallMedian).toFixed(1);
+      }
       const mean = (k) => t.reduce((a, x) => a + x[k], 0) / t.length;
       els.statStages.textContent =
         `${mean("prepMs").toFixed(1)} / ${mean("inferMs").toFixed(1)} / ` +
@@ -1349,6 +1365,7 @@ function wireControls() {
   });
   els.ctlReset.addEventListener("click", () => {
     STATE.timings = [];
+    STATE.wallTimings = [];
     STATE.lastFunnel = null;
     STATE.worker?.postMessage({ type: "reset" });
   });
