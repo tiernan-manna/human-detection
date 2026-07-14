@@ -31,6 +31,7 @@ let activeEp = null;
 let epDetail = "";
 let modelFile = null;
 let modelUrl = null;
+let modelVersion = "";
 let precision = "fp32";
 let modelIsDynamic = true;
 let numClasses = 1;
@@ -127,6 +128,12 @@ async function handleInit(opts) {
   modelFile = manifest.models[precision];
   modelIsDynamic = precision === "fp32"; // fp32 export is dynamic, fp16 static
   modelUrl = `${opts.modelBase || "/webdemo/model"}/${modelFile}`;
+  // Cache-busting key for the Cache Storage entry. Prefer the content hash
+  // written by export_web_model.py; fall back to a coarse fingerprint so
+  // caching still works with an older manifest.
+  modelVersion =
+    (manifest.modelsSha256 && manifest.modelsSha256[precision]) ||
+    `${manifest.sourceModel || "model"}-opset${manifest.opset || 0}`;
 
   const ortBase = manifest.ortVendored ? opts.ortBase || "/webdemo/ort" : null;
   const loaded = await loadOrt(ortBase, opts.allowCdnFallback !== false);
@@ -224,6 +231,51 @@ function epOptionsFor(ep, variant) {
   return ["wasm"];
 }
 
+// Cache Storage bucket for the ONNX model. The ~96 MB file must not be
+// re-downloaded every visit (pilots open the dashboard every shift), and
+// during init the WebNN device probe creates several throwaway sessions —
+// without this each one would re-fetch the model over the network. Entries
+// are keyed by the manifest's content hash, so shipping a new model
+// invalidates naturally (old versions are evicted on the next store).
+const MODEL_CACHE_NAME = "webdetect-model-v1";
+
+async function loadModelBytes() {
+  const cacheKey = `${new URL(modelUrl, self.location.origin).href}?v=${encodeURIComponent(modelVersion)}`;
+  let cache = null;
+  try {
+    if (typeof caches !== "undefined") {
+      cache = await caches.open(MODEL_CACHE_NAME);
+      const hit = await cache.match(cacheKey);
+      if (hit) return new Uint8Array(await hit.arrayBuffer());
+    }
+  } catch {
+    cache = null; // Cache Storage unavailable (private mode, quota) — fetch.
+  }
+  const resp = await fetch(modelUrl);
+  if (!resp.ok) {
+    throw new Error(`model fetch failed (${resp.status}): ${modelUrl}`);
+  }
+  const buf = await resp.arrayBuffer();
+  if (cache) {
+    try {
+      // Evict entries for other model versions before storing this one, so
+      // the cache never holds more than one ~100 MB model per precision.
+      for (const req of await cache.keys()) {
+        if (req.url !== cacheKey) await cache.delete(req);
+      }
+      await cache.put(
+        cacheKey,
+        new Response(buf.slice(0), {
+          headers: { "Content-Type": "application/octet-stream" },
+        })
+      );
+    } catch {
+      /* quota exceeded etc. — caching is best-effort */
+    }
+  }
+  return new Uint8Array(buf);
+}
+
 async function createSession(outH, outW) {
   const key = `${outH}x${outW}`;
   let entry = sessions.get(key);
@@ -242,10 +294,15 @@ async function createSession(outH, outW) {
     ? (sessionEpOptions[0].name ?? sessionEpOptions[0])
     : sessionEpOptions;
 
+  // Fetched from Cache Storage (disk) after the first ever download. Not
+  // memoised in JS: ORT copies the bytes into its own heap, so holding our
+  // own copy would pin an extra ~100 MB for the worker's lifetime.
+  const modelBytes = await loadModelBytes();
+
   let session = null;
   if (epName === "webgpu" && graphCaptureWanted) {
     try {
-      session = await ort.InferenceSession.create(modelUrl, {
+      session = await ort.InferenceSession.create(modelBytes, {
         ...base,
         enableGraphCapture: true,
       });
@@ -256,7 +313,7 @@ async function createSession(outH, outW) {
     }
   }
   if (!session) {
-    session = await ort.InferenceSession.create(modelUrl, base);
+    session = await ort.InferenceSession.create(modelBytes, base);
   }
   entry = { session, inputName: session.inputNames[0], outputName: session.outputNames[0] };
   sessions.set(key, entry);

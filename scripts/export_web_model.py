@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import sys
@@ -55,6 +56,14 @@ ORT_FILES = [
 # for the op set a YOLOv8 detection graph uses (Conv/Sigmoid/Mul/Concat/
 # Resize/MaxPool/Softmax/Split/Add/Sub/Transpose/Reshape/MatMul).
 OPSET = 17
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def export_fp32(model_path: Path, imgsz: int) -> Path:
@@ -175,6 +184,13 @@ def main() -> int:
         "models": {
             "fp32": "waldo-v3-fp32.onnx",
             **({"fp16": "waldo-v3-fp16.onnx"} if fp16_dst else {}),
+        },
+        # Content hashes version the browser-side Cache Storage entry: the
+        # worker caches the model bytes keyed by this hash, so shipping a new
+        # export invalidates every client cache automatically.
+        "modelsSha256": {
+            "fp32": _sha256(fp32_dst),
+            **({"fp16": _sha256(fp16_dst)} if fp16_dst else {}),
         },
         "ortVersion": ORT_WEB_VERSION,
         "ortVendored": (OUT_DIR / "ort" / ORT_FILES[0]).is_file(),
